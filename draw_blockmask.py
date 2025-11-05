@@ -41,13 +41,13 @@ def plot_bar(categories, save_path, baseline_key):
 
         labels = data['labels']
         baseline = data[baseline_key]
-        flashmaskv3 = data['flashmaskv3']
+        flashblockattention = data['flashblockattention']
         x = np.arange(len(labels))
-        increments = [(fm - fa) / fa * 100 for fa, fm in zip(baseline, flashmaskv3)]
+        increments = [(fm - fa) / fa * 100 for fa, fm in zip(baseline, flashblockattention)]
 
         # FlexAttention
-        if baseline_key == 'flashmaskv1':
-            ax.barh(x, baseline, bar_height, label='FlashMask V1', color=colors[0])
+        if baseline_key == 'blockattention':
+            ax.barh(x, baseline, bar_height, label='Block Attention', color=colors[0])
         elif baseline_key == 'flexattention':
             ax.barh(x, baseline, bar_height, label='Flex Attention', color=colors[0])
         elif baseline_key == 'flashmaskv4':
@@ -65,8 +65,8 @@ def plot_bar(categories, save_path, baseline_key):
 
         # FlashMask 增量
         ax.barh(
-            # x, [flashmaskv3[j]-baseline[j] for j in range(len(labels))],
-            x, [max(0, flashmaskv3[j]-baseline[j]) for j in range(len(labels))],
+            # x, [flashblockattention[j]-baseline[j] for j in range(len(labels))],
+            x, [max(0, flashblockattention[j]-baseline[j]) for j in range(len(labels))],
             bar_height, left=baseline, label='FlashMask V3', color=colors[1]
         )
 
@@ -75,8 +75,8 @@ def plot_bar(categories, save_path, baseline_key):
             increment = increments[j]
             sign = '+' if increment >= 0 else ''
             ax.text(
-                max(baseline[j] + max(baseline)*0.005, flashmaskv3[j] + max(flashmaskv3)*0.005), x[j],
-                f'{flashmaskv3[j]:.1f} ({sign}{increment:.1f}%)',
+                max(baseline[j] + max(baseline)*0.005, flashblockattention[j] + max(flashblockattention)*0.005), x[j],
+                f'{flashblockattention[j]:.1f} ({sign}{increment:.1f}%)',
                 va='center', ha='left', fontsize=12, color='black',
                 fontproperties=font_prop
             )
@@ -113,18 +113,18 @@ def main(baseline: str = "flashmaskv1"):
     root_dir = '.'
     # for dtype in ['bf16', 'fp16']:
     for kernel in ["fwd", "bwd"]:
-        for dtype in ['bf16']:
+        for dtype in ['bfloat16']:
             # for headdim in [128, 64]:
             for headdim in [128]:
                 categories = {}
-                for seqlen in [131072]:
-                # for seqlen in [8192]:
+                for seqlen in [8192, 32768, 32768 * 4]:
+                # for seqlen in [8192, 32768]:
                     method_to_df = {}
-                    for method in [baseline, 'flashmaskv3']:
-                        filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}*.csv')
+                    for method in [baseline, 'flashblockattention']:
+                        filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}*_processed.csv')
                         print(filenames)
                         dataframes = []
-                        non_numeric_column = 'Operation              '
+                        non_numeric_column = 'Causal  '
 
                         if kernel == "fwd":
                             metric = '  FW TFLOPs/s'
@@ -133,27 +133,36 @@ def main(baseline: str = "flashmaskv1"):
                         else:
                             raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
 
-                        columns_to_average = [metric, '  Sparsity']
+                        columns_to_average = [metric]
 
                         for file_path in filenames:
                             df = read_tsv_to_dataframe(file_path)
                             dataframes.append(df)
         
                         aligned_dataframes = [df[columns_to_average] for df in dataframes]
+                        print(aligned_dataframes)
                         combined_data = pd.concat(aligned_dataframes, axis=0, keys=range(len(dataframes)))
                         mean_df = combined_data.groupby(level=1).mean()
+                        # print(dataframes[0])
+                        print(dataframes[0].columns.tolist())
                         mean_df[non_numeric_column] = dataframes[0][non_numeric_column]
                         mean_df = mean_df[[non_numeric_column] + columns_to_average] 
+                        mean_df['  Sparsity'] =  dataframes[0]['  Sparsity']
                         method_to_df[method] = mean_df
                         print('='*20)
                         print(mean_df)
                     one_item = {}
-                    labels = method_to_df['flashmaskv3']['Operation              '].tolist()
+                    print(method_to_df['flashblockattention'])
+                    labels = [
+                        f"causal:{str(causal).strip()}, sparsity:{str(sparsity).strip()}"
+                        for causal, sparsity in zip(df[non_numeric_column], df['  Sparsity'])
+                    ]
+                    print(labels)
                     labels = [label.strip() for label in labels]
                     one_item['labels'] = labels
                     one_item[baseline] = method_to_df[baseline][metric].tolist()
-                    one_item['flashmaskv3 improvement'] = (method_to_df['flashmaskv3'][metric] - method_to_df[baseline][metric]).tolist()
-                    one_item['flashmaskv3'] = method_to_df['flashmaskv3'][metric].tolist()
+                    one_item['flashblockattention improvement'] = (method_to_df['flashblockattention'][metric] - method_to_df[baseline][metric]).tolist()
+                    one_item['flashblockattention'] = method_to_df['flashblockattention'][metric].tolist()
                     if kernel == "fwd":
                         one_item['xlabel'] = 'Fwd Speed (TFLOPs/s)'
                     elif kernel == "bwd":
@@ -162,7 +171,7 @@ def main(baseline: str = "flashmaskv1"):
                         raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
 
                     categories[f'Sequence length {seqlen//1024}K, head dim {headdim}'] = one_item
-                plot_bar(categories, f'{root_dir}/flashmaskv3_vs_{baseline}_{dtype}_{headdim}_{kernel}', baseline)
+                plot_bar(categories, f'{root_dir}/flashblockmask_vs_{baseline}_{dtype}_{headdim}_{kernel}', baseline)
 
 if __name__ == "__main__":
     from jsonargparse import ArgumentParser
@@ -171,7 +180,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--baseline",
         type=str,
-        default="flashmaskv1"
+        default="blockattention"
     )
 
     args = parser.parse_args()

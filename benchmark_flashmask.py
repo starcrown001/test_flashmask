@@ -11,6 +11,7 @@ import os
 
 np.random.seed(0)
 random.seed(0)
+paddle.seed(42)
 
 def _summarize_statistics(times, quantiles, return_mode):
     if quantiles is not None:
@@ -86,6 +87,7 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
     for _ in range(n_warmup):
         fn()
     # Benchmark
+    paddle.base.core.nvprof_nvtx_push("paddle")
     for i in range(n_repeat):
         # we don't want `fn` to accumulate gradient values
         # if it contains a backward pass. So we clear the
@@ -101,6 +103,7 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
         end_event[i].record()
     # Record clocks
     paddle.device.synchronize()
+    paddle.base.core.nvprof_nvtx_pop()
     times = paddle.to_tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=paddle.float32)
     return _summarize_statistics(times, quantiles, return_mode)
 
@@ -127,6 +130,11 @@ def test_mask(
     key = paddle.randn([B, S, H, D], dtype=data_type)
     value = paddle.randn([B, S, H, D], dtype=data_type)
     gradOut = paddle.randn([B, S, H, D], dtype=data_type)
+    
+    paddle.save(query,'query.pd')
+    paddle.save(key,'key.pd')
+    paddle.save(value,'value.pd')
+    paddle.save(gradOut,'g.pd')
 
     query.stop_gradient = False
     key.stop_gradient = False
@@ -135,6 +143,7 @@ def test_mask(
     startend_row_indices, causal = None, True
     if generate_mask_fn is not None:
         startend_row_indices, causal = generate_mask_fn(B, S, H, D)
+    paddle.save(startend_row_indices,'startend_row_indices.pd')
 
     sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, S)
     density = 1.0 - sparsity 
@@ -545,7 +554,7 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1):
     """
     if fm_version == 1:
         paddle.set_flags({'FLAGS_flash_attn_version': 2})
-    elif fm_version == 3:
+    elif fm_version == 3 or fm_version == 4:
         paddle.set_flags({'FLAGS_flash_attn_version': 3})
     else:
         raise ArgumentError(f"fm_version must be 1 or 3, but got {fm_version}")
@@ -584,18 +593,18 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1):
                 share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
 
                 available_examples = {
-                    "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=S, H=H, D=D, dtype=dtype),
                     "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=S, H=H, D=D, dtype=dtype),
                 }
 
                 if "all" in examples:

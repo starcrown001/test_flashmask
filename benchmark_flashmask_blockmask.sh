@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=4 /root/paddlejob/workspace/env_run/xiehaoyang/fm_env/bin/python benchmark_flashmask.py --dtype bf16 --fm_version 4
