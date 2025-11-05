@@ -537,7 +537,7 @@ def split_sequence(sequence_length):
 
     return lengths
 
-def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1):
+def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_base", overwrite=True):
     """Run the benchmark with the given examples.
 
     Args:
@@ -564,7 +564,7 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1):
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
             
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
-        for D in [128]:
+        for D in [128, 64]:
             H = 4096 // D
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 128 * 1024 // S
@@ -573,6 +573,10 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1):
                 maskout_pair = []
                 offset = 0
                 print(f"{B}_{S}_{H}_{D}_{idx}_{dtype}")
+                if not overwrite:
+                    if os.path.exists(f"{dtype}{suffix}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{idx}.csv"):
+                        print(f"{dtype}{suffix}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{idx}.csv already exists, skipping. To enable overwrite, use: --overwrite (True by default).")
+                        continue
                 if sum(qksparse_mask) == 0:
                     maskout_pair = [(1024, 538), (2358, 1700)]
                 else:
@@ -634,8 +638,8 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1):
                     )
                 )
                 content2=tabulate(results, headers=headers, tablefmt="tsv")
-                os.makedirs(f"{dtype}", exist_ok=True)
-                text_file = open(f"{dtype}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{idx}.csv","w")
+                os.makedirs(f"{dtype}{suffix}", exist_ok=True)
+                text_file = open(f"{dtype}{suffix}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{idx}.csv","w")
                 text_file.write(content2)
                 text_file.close()
 
@@ -661,6 +665,15 @@ if __name__ == "__main__":
         type=int,
         default=1
     )
+    parser.add_argument(
+        "--suffix",
+        type=str,
+        default=""
+    )
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--overwrite", action="store_true", default=True)
+    group.add_argument("--no-overwrite", action="store_false", dest="overwrite")
 
     args = parser.parse_args()
     main(**vars(args))
