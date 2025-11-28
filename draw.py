@@ -52,6 +52,10 @@ def plot_bar(categories, save_path, baseline_key):
             ax.barh(x, baseline, bar_height, label='Flex Attention', color=colors[0])
         elif baseline_key == 'old_flashmaskv3':
             ax.barh(x, baseline, bar_height, label='Old FlashMask V3 (2 weeks ago)', color=colors[0])
+        elif baseline_key == 'flashmaskv4':
+            ax.barh(x, baseline, bar_height, label='Block Attention', color=colors[0])
+        elif baseline_key == 'magiattention':
+            ax.barh(x, baseline, bar_height, label='Magi Attention', color=colors[0])
         else:
             raise ValueError(f"baselinekey must be flashmaskv1, flexattention or old_flashmaskv3, got {baseline_key}")
 
@@ -115,9 +119,10 @@ def main(baseline: str = "flashmaskv1"):
     # for dtype in ['bf16', 'fp16']:
     for kernel in ["fwd", "bwd", "total"]:
         for dtype in ['bf16']:
-            for headdim in [64, 128, 256]:
+            for headdim in [64, 128]:
                 categories = {}
-                for seqlen in [8192, 32768, 131072]:
+                for seqlen in [32768,131072]:
+                # for seqlen in [8192]:
                     method_to_df = {}
                     for method in [baseline, 'flashmaskv3']:
                         filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}*.csv')
