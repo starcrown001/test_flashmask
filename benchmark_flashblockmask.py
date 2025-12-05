@@ -194,7 +194,7 @@ def test_block_mask(
         start_row_indices, causal = generate_ones_mask(B, S, H, D)
     
     base_blockmask = base_blockmask.unsqueeze(0).repeat(start_row_indices.shape[0], start_row_indices.shape[1], 1, 1).astype(paddle.int32)
-    flash_block_attention_call = lambda: flashmask_attention(q, k, v, startend_row_indices=start_row_indices, causal=causal, block_mask_indices=base_blockmask)
+    flash_block_attention_call = lambda: flashmask_attention(q, k, v, startend_row_indices=start_row_indices, causal=causal, block_mask=base_blockmask)
 
     # Forward pass
     #print("pt0")
@@ -280,7 +280,7 @@ def main():
     batch_size = 1
     sparsity_sampling_steps = 5
     # seqlen_vals = [1024,2048,4096,8192,16384,32768,65536,65536 * 2]
-    seqlen_vals = [65536 * 2]
+    seqlen_vals = [8192, 32768, 65536 * 2]
     headdim = 128
     dim = 4096
     dropout_p = 0.0

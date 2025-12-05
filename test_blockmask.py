@@ -189,7 +189,7 @@ def test_flashmask(
         startend_row_indices=startend_row_indices,
         causal=causal,
         return_softmax_lse=True,
-        block_mask_indices=blockmask
+        block_mask=blockmask
     )
     print(f"flashmask output max at {(out - out_ref).abs().argmax()}")
     print(f"flashmask Output max diff: {(out - out_ref).abs().max().item()}")
