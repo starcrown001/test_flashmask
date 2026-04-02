@@ -5,7 +5,8 @@ from typing import Optional, List
 import random
 
 from block_sparse_attn import (
-    block_sparse_attn_func
+    block_sparse_attn_func,
+    flash_attn_varlen_func,
 )
 
 import torch

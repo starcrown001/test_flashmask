@@ -125,19 +125,17 @@ def test_mask(
     #H = 4
     #D = 128
     
-    # H = 8
-    
-    GQA_fac = 1
+    H = 8
 
     if dtype == 'bf16':
         data_type = paddle.bfloat16
     else:
         data_type = paddle.float16
 
-    query = paddle.randn([B, S, H * GQA_fac, D], dtype=data_type)
+    query = paddle.randn([B, S, H * 8, D], dtype=data_type)
     key = paddle.randn([B, S, H, D], dtype=data_type)
     value = paddle.randn([B, S, H, D], dtype=data_type)
-    gradOut = paddle.randn([B, S, H * GQA_fac, D], dtype=data_type)
+    gradOut = paddle.randn([B, S, H * 8, D], dtype=data_type)
     
     # global cur_num
     # query = paddle.to_tensor(np.load(f"tmp_res/q_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy")).view(data_type).reshape([1,S,H,D])
@@ -163,13 +161,7 @@ def test_mask(
     sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, S)
     density = 1.0 - sparsity 
 
-    # startend_row_indices1 = paddle.to_tensor(np.load(f'/root/paddlejob/workspace/env_run/xiehaoyang/magiattn/MagiAttention/exps/attn/outs/dump_tensors/gsw_{S}_{S}.npy')).to(query.device)
-    # diff = startend_row_indices1 - startend_row_indices
-    # print(diff)
-    # print(diff.max().item(),diff.min().item())
-    # print(startend_row_indices1[:,:,:,0])
-    # print(startend_row_indices[:,:,:,0])
-    # assert diff.abs().max().item() == 0
+    startend_row_indices = np.load()
     flashmask = lambda: flashmask_attention(query, key, value, startend_row_indices=startend_row_indices, causal=causal)
 
     fwd_time_ms = do_bench(flashmask)
@@ -187,9 +179,9 @@ def test_mask(
 
     total_time_ms = fwd_time_ms + bwd_time_ms
 
-    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd') * GQA_fac
-    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd') * GQA_fac
-    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd') * GQA_fac
+    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd') * 8
+    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd') * 8
+    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd') * 8
 
     fwd_tflops = cal_tflops(fwd_flops, fwd_time_ms)
     bwd_tflops = cal_tflops(bwd_flops, bwd_time_ms)
@@ -418,11 +410,11 @@ def generate_global_sliding_window_mask(B, S, H, D, global_token=16, window_size
     down_left_start_row_indices = paddle.arange(
         left_window_size + 1, S + left_window_size + 1, dtype="int32"
     ).clip(max=S)
-    down_left_start_row_indices[:global_token] = S
+    down_left_start_row_indices[:global_token] = 0
     down_left_start_row_indices = down_left_start_row_indices.reshape((1, 1, S, 1)).repeat_interleave(B, 0)
 
     down_left_end_row_indices = paddle.full([S], S, dtype="int32")
-    down_left_end_row_indices[:global_token] = S
+    down_left_end_row_indices[:global_token] = 0
     down_left_end_row_indices = down_left_end_row_indices.reshape((1, 1, S, 1)).repeat_interleave(B, 0)
 
     up_right_start_row_indices = paddle.full([S], global_token, dtype="int32")
@@ -603,10 +595,10 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
             
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
         for D in [128]:
-            H = 4096 // D
+            H = 64
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 1
-                if(S >  64 * 1024 ):
+                if(S > 64 * 1024 ):
                     continue
 
                 doc_seq_lens = [x[1] for x in prefix_doc_seq_lens]
@@ -628,17 +620,17 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
 
                 available_examples = {
-                    "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=1024, window_size=(1024,1024)), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=S, H=H, D=D, dtype=dtype),
+                    "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=S, H=H, D=D, dtype=dtype),
                     # "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=S, H=H, D=D, dtype=dtype),
                 }
                 

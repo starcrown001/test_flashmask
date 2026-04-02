@@ -47,9 +47,10 @@ def plot_bar(categories, save_path, baseline_key):
         baseline = data[baseline_key]
         flashmaskv3 = data['flashmaskv3']
         x = np.arange(len(labels))
+        # 对于时间，改进是负百分比（时间减少）
         increments = [(fm - fa) / fa * 100 for fa, fm in zip(baseline, flashmaskv3)]
 
-        # FlexAttention
+        # 绘制 baseline 柱状图
         if baseline_key == 'flashmaskv1':
             ax.barh(x, baseline, bar_height, label='FlashMask V1', color=colors[0])
         elif baseline_key == 'flexattention':
@@ -63,6 +64,7 @@ def plot_bar(categories, save_path, baseline_key):
         else:
             raise ValueError(f"baselinekey must be flashmaskv1, flexattention or old_flashmaskv3, got {baseline_key}")
 
+        # 在 baseline 柱状图右端内部标注白色数字
         for j in range(len(labels)):
             ax.text(
                 baseline[j] - max(baseline)*0.01, x[j],
@@ -71,19 +73,15 @@ def plot_bar(categories, save_path, baseline_key):
                 fontproperties=font_prop
             )
 
-        # FlashMask 增量
-        ax.barh(
-            # x, [flashmaskv3[j]-baseline[j] for j in range(len(labels))],
-            x, [max(0, flashmaskv3[j]-baseline[j]) for j in range(len(labels))],
-            bar_height, left=baseline, label='FlashMask V3', color=colors[1]
-        )
+        # 绘制 FlashMask V3 柱状图
+        ax.barh(x, flashmaskv3, bar_height, label='FlashMask V3', color=colors[1])
 
-        # 增量外部数值
+        # 在 flashmaskv3 柱状图右端外部标注时间和改进百分比
         for j in range(len(labels)):
             increment = increments[j]
-            sign = '+' if increment >= 0 else ''
+            sign = '' if increment < 0 else '+'
             ax.text(
-                max(baseline[j] + max(baseline)*0.005, flashmaskv3[j] + max(flashmaskv3)*0.005), x[j],
+                max(baseline[j], flashmaskv3[j]) + max(baseline)*0.005, x[j],
                 f'{flashmaskv3[j]:.1f} ({sign}{increment:.1f}%)',
                 va='center', ha='left', fontsize=12, color='black',
                 fontproperties=font_prop
@@ -118,7 +116,7 @@ def plot_bar(categories, save_path, baseline_key):
 
 def main(baseline: str = "flashmaskv1"):
     plt.rcParams['font.family'] = "Liberation Mono"
-    
+
     root_dir = '.'
     # for dtype in ['bf16', 'fp16']:
     for kernel in ["fwd", "bwd", "total"]:
@@ -126,20 +124,20 @@ def main(baseline: str = "flashmaskv1"):
             for headdim in [128]:
                 categories = {}
                 # for seqlen in [32768,131072]:
-                for seqlen in [8192,16384,32768,65536,131072]:
+                for seqlen in [8192,32768,131072]:
                 # for seqlen in [8192]:
                     method_to_df = {}
                     for method in [baseline, 'flashmaskv3']:
-                        filenames = glob.glob(f'{root_dir}/{dtype}gsw/{method}_*{seqlen}_*_{headdim}*.csv')
+                        filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}*.csv')
                         print(filenames)
                         dataframes = []
                         non_numeric_column = 'Operation'
                         if kernel == "fwd":
-                            metric = 'FW TFLOPs/s'
+                            metric = 'FW Time (ms)'
                         elif kernel == "bwd":
-                            metric = 'BW TFLOPs/s'
+                            metric = 'BW Time (ms)'
                         elif kernel == "total":
-                            metric = 'TOTAL TFLOPs/s'
+                            metric = 'TOTAL Time (ms)'
                         else:
                             raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
 
@@ -148,17 +146,28 @@ def main(baseline: str = "flashmaskv1"):
                         for file_path in filenames:
                             df = read_tsv_to_dataframe(file_path)
                             dataframes.append(df)
-        
+
+                        if len(dataframes) == 0:
+                            print(f"No files found for {method} with seqlen {seqlen}")
+                            method_to_df[method] = None
+                            continue
+
                         aligned_dataframes = [df[columns_to_average] for df in dataframes]
                         combined_data = pd.concat(aligned_dataframes, axis=0, keys=range(len(dataframes)))
                         mean_df = combined_data.groupby(level=1).mean()
                         print(mean_df)
                         print(dataframes[0].keys())
                         mean_df[non_numeric_column] = dataframes[0][non_numeric_column]
-                        mean_df = mean_df[[non_numeric_column] + columns_to_average] 
+                        mean_df = mean_df[[non_numeric_column] + columns_to_average]
                         method_to_df[method] = mean_df
                         print('='*20)
                         print(mean_df)
+
+                    # 检查是否有有效的数据
+                    if method_to_df.get(baseline) is None or method_to_df.get('flashmaskv3') is None:
+                        print(f"Skipping seqlen {seqlen} due to missing data")
+                        continue
+
                     one_item = {}
                     # 获取两个方法都有的共同操作
                     baseline_ops = set(method_to_df[baseline]['Operation'].tolist())
@@ -181,16 +190,16 @@ def main(baseline: str = "flashmaskv1"):
                     one_item['flashmaskv3 improvement'] = [fm - fa for fm, fa in zip(flashmaskv3_values, baseline_values)]
                     one_item['flashmaskv3'] = flashmaskv3_values
                     if kernel == "fwd":
-                        one_item['xlabel'] = 'Fwd Speed (TFLOPs/s)'
+                        one_item['xlabel'] = 'Fwd Time (ms)'
                     elif kernel == "bwd":
-                        one_item['xlabel'] = 'Bwd Speed (TFLOPs/s)'
+                        one_item['xlabel'] = 'Bwd Time (ms)'
                     elif kernel == "total":
-                        one_item['xlabel'] = 'Total Speed (TFLOPs/s)'
+                        one_item['xlabel'] = 'Total Time (ms)'
                     else:
                         raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
 
                     categories[f'Sequence length {seqlen//1024}K, head dim {headdim}'] = one_item
-                plot_bar(categories, f'{root_dir}/flashmaskv3_vs_{baseline}_{dtype}_{headdim}_{kernel}', baseline)
+                plot_bar(categories, f'{root_dir}/flashmaskv3_vs_{baseline}_{dtype}_{headdim}_{kernel}_time', baseline)
 
 if __name__ == "__main__":
     from jsonargparse import ArgumentParser

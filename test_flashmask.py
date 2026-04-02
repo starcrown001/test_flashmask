@@ -120,6 +120,15 @@ def test_flashmask(
     v.stop_gradient = False
 
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
+    
+    if(startend_row_indices != None):
+        startend_row_indices_chunks = []
+        chunk_size = seqlen_k // 4
+        for i in range(3):
+            startend_row_indices_chunks.append(startend_row_indices[:,:,seqlen_k - (i+1) * chunk_size:seqlen_k - i * chunk_size,:])
+        startend_row_indices_chunks.append(startend_row_indices[:,:,:seqlen_k - 3 * chunk_size,:])
+        startend_row_indices = paddle.concat(startend_row_indices_chunks, axis=2)
+
 
     if startend_row_indices is None and causal and d in (80, 192):
       pytest.skip(f"Skipping because running headdim {d} with flash_attn in causal mask")

@@ -125,19 +125,17 @@ def test_mask(
     #H = 4
     #D = 128
     
-    # H = 8
-    
-    GQA_fac = 1
+    H = 8
 
     if dtype == 'bf16':
         data_type = paddle.bfloat16
     else:
         data_type = paddle.float16
 
-    query = paddle.randn([B, S, H * GQA_fac, D], dtype=data_type)
+    query = paddle.randn([B, S, H * 8, D], dtype=data_type)
     key = paddle.randn([B, S, H, D], dtype=data_type)
     value = paddle.randn([B, S, H, D], dtype=data_type)
-    gradOut = paddle.randn([B, S, H * GQA_fac, D], dtype=data_type)
+    gradOut = paddle.randn([B, S, H * 8, D], dtype=data_type)
     
     # global cur_num
     # query = paddle.to_tensor(np.load(f"tmp_res/q_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy")).view(data_type).reshape([1,S,H,D])
@@ -187,9 +185,9 @@ def test_mask(
 
     total_time_ms = fwd_time_ms + bwd_time_ms
 
-    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd') * GQA_fac
-    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd') * GQA_fac
-    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd') * GQA_fac
+    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd') * 8
+    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd') * 8
+    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd') * 8
 
     fwd_tflops = cal_tflops(fwd_flops, fwd_time_ms)
     bwd_tflops = cal_tflops(bwd_flops, bwd_time_ms)

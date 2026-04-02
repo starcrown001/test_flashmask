@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=7 /root/paddlejob/workspace/env_run/xiehaoyang/magiattn_env/bin/python benchmark_magiattention.py --dtype bf16 

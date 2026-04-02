@@ -124,31 +124,27 @@ def test_mask(
     #S = 8192
     #H = 4
     #D = 128
-    
-    # H = 8
-    
-    GQA_fac = 1
 
     if dtype == 'bf16':
         data_type = paddle.bfloat16
     else:
         data_type = paddle.float16
 
-    query = paddle.randn([B, S, H * GQA_fac, D], dtype=data_type)
+    query = paddle.randn([B, S, H, D], dtype=data_type)
     key = paddle.randn([B, S, H, D], dtype=data_type)
     value = paddle.randn([B, S, H, D], dtype=data_type)
-    gradOut = paddle.randn([B, S, H * GQA_fac, D], dtype=data_type)
+    gradOut = paddle.randn([B, S, H, D], dtype=data_type)
     
-    # global cur_num
-    # query = paddle.to_tensor(np.load(f"tmp_res/q_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy")).view(data_type).reshape([1,S,H,D])
-    # key = paddle.to_tensor(np.load(f"tmp_res/k_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy")).view(data_type).reshape([1,S,H,D])
-    # value = paddle.to_tensor(np.load(f"tmp_res/v_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy")).view(data_type).reshape([1,S,H,D])
-    # gradOut = paddle.to_tensor(np.load(f"tmp_res/gradOut_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy")).view(data_type).reshape([1,S,H,D])
+    global cur_num
+    query = paddle.to_tensor(np.load(f"tmp_res/q_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy")).view(data_type).reshape([1,S,H,D])
+    key = paddle.to_tensor(np.load(f"tmp_res/k_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy")).view(data_type).reshape([1,S,H,D])
+    value = paddle.to_tensor(np.load(f"tmp_res/v_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy")).view(data_type).reshape([1,S,H,D])
+    gradOut = paddle.to_tensor(np.load(f"tmp_res/gradOut_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy")).view(data_type).reshape([1,S,H,D])
     
-    # np.save(f"tmp_res/paddle_q_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", query.view(paddle.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/paddle_k_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", key.view(paddle.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/paddle_v_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", value.view(paddle.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/paddle_gradOut_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", gradOut.view(paddle.float32).detach().cpu().numpy())
+    np.save(f"tmp_res/paddle_q_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", query.view(paddle.float32).detach().cpu().numpy())
+    np.save(f"tmp_res/paddle_k_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", key.view(paddle.float32).detach().cpu().numpy())
+    np.save(f"tmp_res/paddle_v_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", value.view(paddle.float32).detach().cpu().numpy())
+    np.save(f"tmp_res/paddle_gradOut_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", gradOut.view(paddle.float32).detach().cpu().numpy())
 
 
     query.stop_gradient = False
@@ -163,40 +159,19 @@ def test_mask(
     sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, S)
     density = 1.0 - sparsity 
 
-    # startend_row_indices1 = paddle.to_tensor(np.load(f'/root/paddlejob/workspace/env_run/xiehaoyang/magiattn/MagiAttention/exps/attn/outs/dump_tensors/gsw_{S}_{S}.npy')).to(query.device)
-    # diff = startend_row_indices1 - startend_row_indices
-    # print(diff)
-    # print(diff.max().item(),diff.min().item())
-    # print(startend_row_indices1[:,:,:,0])
-    # print(startend_row_indices[:,:,:,0])
-    # assert diff.abs().max().item() == 0
     flashmask = lambda: flashmask_attention(query, key, value, startend_row_indices=startend_row_indices, causal=causal)
-
-    fwd_time_ms = do_bench(flashmask)
 
     flashmask_out = flashmask()
 
-    bwd_time_ms = do_bench(lambda: flashmask_out.backward(gradOut, retain_graph=True))
-    # flashmask_out.backward(gradOut, retain_graph=True)
+    flashmask_out.backward(gradOut, retain_graph=True)
     
-    # np.save(f"tmp_res/flashmask_out_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", flashmask_out.cast(paddle.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/flashmask_q_grad_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", query.grad.cast(paddle.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/flashmask_k_grad_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", key.grad.cast(paddle.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/flashmask_v_grad_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", value.cast(paddle.float32).detach().cpu().numpy())
-    # cur_num += 1
+    np.save(f"tmp_res/flashmask_out_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", flashmask_out.cast(paddle.float32).detach().cpu().numpy())
+    np.save(f"tmp_res/flashmask_q_grad_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", query.grad.cast(paddle.float32).detach().cpu().numpy())
+    np.save(f"tmp_res/flashmask_k_grad_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", key.grad.cast(paddle.float32).detach().cpu().numpy())
+    np.save(f"tmp_res/flashmask_v_grad_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", value.grad.cast(paddle.float32).detach().cpu().numpy())
+    cur_num += 1
 
-    total_time_ms = fwd_time_ms + bwd_time_ms
-
-    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd') * GQA_fac
-    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd') * GQA_fac
-    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd') * GQA_fac
-
-    fwd_tflops = cal_tflops(fwd_flops, fwd_time_ms)
-    bwd_tflops = cal_tflops(bwd_flops, bwd_time_ms)
-    total_tflops = cal_tflops(total_flops, total_time_ms)
-
-    return fwd_time_ms, bwd_time_ms, total_time_ms, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity
-
+    return
 def flashmask_block_sparsity(
     causal,
     flashmask,
@@ -418,11 +393,11 @@ def generate_global_sliding_window_mask(B, S, H, D, global_token=16, window_size
     down_left_start_row_indices = paddle.arange(
         left_window_size + 1, S + left_window_size + 1, dtype="int32"
     ).clip(max=S)
-    down_left_start_row_indices[:global_token] = S
+    down_left_start_row_indices[:global_token] = 0
     down_left_start_row_indices = down_left_start_row_indices.reshape((1, 1, S, 1)).repeat_interleave(B, 0)
 
     down_left_end_row_indices = paddle.full([S], S, dtype="int32")
-    down_left_end_row_indices[:global_token] = S
+    down_left_end_row_indices[:global_token] = 0
     down_left_end_row_indices = down_left_end_row_indices.reshape((1, 1, S, 1)).repeat_interleave(B, 0)
 
     up_right_start_row_indices = paddle.full([S], global_token, dtype="int32")
@@ -602,12 +577,10 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
             
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
-        for D in [128]:
+        for D in [64, 128, 256]:
             H = 4096 // D
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 1
-                if(S >  64 * 1024 ):
-                    continue
 
                 doc_seq_lens = [x[1] for x in prefix_doc_seq_lens]
                 maskout_pair = []
@@ -634,12 +607,12 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                     "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
                     "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
                     "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=1024, window_size=(1024,1024)), B=B, S=S, H=H, D=D, dtype=dtype),
+                    "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, D=D, dtype=dtype),
                     "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
                     "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
                     "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=S, H=H, D=D, dtype=dtype),
                     "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=S, H=H, D=D, dtype=dtype),
-                    # "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=S, H=H, D=D, dtype=dtype),
+                    "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=S, H=H, D=D, dtype=dtype),
                 }
                 
                 global total_num
@@ -654,38 +627,11 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 for ex in ex_to_run:
                     if ex in available_examples:
                         print(ex)
-                        fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = available_examples[ex]()
-                        results.append([ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}"])
+                        available_examples[ex]()
                     else:
                         print(f"Warning: Unknown example key '{ex}'. Skipping.")
 
-                # Usage in your results formatting:
-                headers = [
-                    "Operation",
-                    "FW Time (ms)",
-                    "BW Time (ms)",
-                    "TOTAL Time (ms)",
-                    "FW FLOPs",
-                    "BW FLOPs",
-                    "TOTAL FLOPs",
-                    "FW TFLOPs/s",
-                    "BW TFLOPs/s",
-                    "TOTAL TFLOPs/s",
-                    "Sparsity",
-                ]
-                print(
-                    tabulate(
-                        results,
-                        headers=headers,
-                        tablefmt="grid",
-                    )
-                )
-                content2=tabulate(results, headers=headers, tablefmt="tsv")
-                os.makedirs(f"{dtype}{suffix}", exist_ok=True)
-                text_file = open(f"{dtype}{suffix}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{idx}.csv","w")
-                text_file.write(content2)
-                text_file.close()
-                # assert False
+                assert False
 
 if __name__ == "__main__":
     from jsonargparse import ArgumentParser

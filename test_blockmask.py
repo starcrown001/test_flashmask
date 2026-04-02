@@ -35,6 +35,7 @@ shape_cases = (
         (1, 128, 128, 1, 1),
         (1, 127, 128, 1, 1),
         (1, 16384, 16384, 1, 1),
+        (1, 32768+128, 32768+128,1,1)
         # (2, 16384, 16383, 4, 1),
         # my case
     ]
@@ -189,7 +190,7 @@ def test_flashmask(
         startend_row_indices=startend_row_indices,
         causal=causal,
         return_softmax_lse=True,
-        block_mask_indices=blockmask
+        block_mask=blockmask
     )
     print(f"flashmask output max at {(out - out_ref).abs().argmax()}")
     print(f"flashmask Output max diff: {(out - out_ref).abs().max().item()}")

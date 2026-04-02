@@ -43,9 +43,11 @@ def create_block_mask_cached(score_mod, B, H, M, N, device="cuda"):
 def calculate_tflops(flops: float, time_ms: float, multiplier: int) -> float:
     return multiplier * flops * (1e3 / time_ms) / 1e12
 
-def cal_flops(B, H, Sq, Sk, D, mode='fwd'):
+def cal_flops(B, H, Sq, Sk, D, mode='fwd', causal=False):
     assert mode in ["fwd", "bwd", "fwd_bwd"]
     f = 4 * B * Sq * Sk * H * D
+    if(causal):
+        f *= 0.5
     return f if mode == "fwd" else (2.5 * f if mode == "bwd" else 3.5 * f)
 
 def cal_tflops(flops, time_ms):
@@ -194,7 +196,7 @@ def test_block_mask(
         start_row_indices, causal = generate_ones_mask(B, S, H, D)
     
     base_blockmask = base_blockmask.unsqueeze(0).repeat(start_row_indices.shape[0], start_row_indices.shape[1], 1, 1).astype(paddle.int32)
-    flash_block_attention_call = lambda: flashmask_attention(q, k, v, startend_row_indices=start_row_indices, causal=causal, block_mask_indices=base_blockmask)
+    flash_block_attention_call = lambda: flashmask_attention(q, k, v, startend_row_indices=None, causal=causal, block_mask=None)
 
     # Forward pass
     #print("pt0")
@@ -208,9 +210,9 @@ def test_block_mask(
     total_time_ms = fwd_time_ms + bwd_time_ms
 
     density = 1 - real_sparsity
-    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd')
-    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd')
-    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd')
+    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd', causal=causal)
+    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd', causal=causal)
+    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd', causal=causal)
 
     fwd_tflops = cal_tflops(fwd_flops, fwd_time_ms)
     bwd_tflops = cal_tflops(bwd_flops, bwd_time_ms)
@@ -275,12 +277,12 @@ def main():
     repeats = 15
     block_sparse_repeats = 3
     device = 'cuda:0'
-    dtype = 'bfloat16'
+    dtype = 'bfloat161'
     causal = True
     batch_size = 1
     sparsity_sampling_steps = 5
-    # seqlen_vals = [1024,2048,4096,8192,16384,32768,65536,65536 * 2]
-    seqlen_vals = [65536 * 2]
+    seqlen_vals = [8192,16384,32768,65536]
+    # seqlen_vals = [ 65536 * 2]
     headdim = 128
     dim = 4096
     dropout_p = 0.0

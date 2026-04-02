@@ -4,8 +4,13 @@ from functools import lru_cache
 from typing import Optional, List
 import random
 
-from block_sparse_attn import (
-    block_sparse_attn_func
+from magi_attention.common.enum import AttnMaskType
+from magi_attention.common.mask import AttnMask
+from magi_attention.common.range import AttnRange
+from magi_attention.functional import flex_flash_attn_func as ffa_func
+
+from magi_attention.utils.sparse_utils import (
+    generate_ranges_from_block_mask,
 )
 
 import torch
@@ -82,20 +87,25 @@ def test_block_mask(
     v = torch.randn(shape, device=device, dtype=data_type, requires_grad=True)
     gradOut = torch.randn(shape, device=device, dtype=data_type)
 
-    block_attention_call = lambda: flex_attention(*qkv, score_mod=score_mod, block_mask=block_mask)
+    # block_attention_call = lambda: flex_attention(*qkv, score_mod=score_mod, block_mask=block_mask)
 
     cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32, device=device)
     head_mask_type = torch.tensor([1] * nheads, device=device, dtype=torch.int32)
     base_blockmask, real_sparsity = generate_base_sparsity_mask(seqlen, seqlen, block_size, block_size, block_size, sparsity, causal = causal, device=device)
+    print(base_blockmask.shape)
+    # base_blockmask = base_blockmask.unsqueeze(0).repeat(batch_size, nheads, 1, 1)
+    q_ranges, k_ranges = generate_ranges_from_block_mask(
+        base_blockmask, 128, 128
+    )
     base_blockmask = base_blockmask.unsqueeze(0).repeat(batch_size, nheads, 1, 1)
-    
-    block_attention_call = lambda: block_sparse_attn_func(q, k, v, cu_seqlens, cu_seqlens, head_mask_type, None, base_blockmask, seqlen, seqlen, dropout_p, is_causal=causal, exact_streaming=False)
+    attn_type_map = torch.zeros(len(q_ranges), dtype=torch.int32, device="cuda")
+    magi_attention_call = lambda: ffa_func(q, k, v, q_ranges, k_ranges, attn_type_map, disable_fwd_atomic_reduction = True)
 
     # Forward pass
-    fwd_time_ms = do_bench(block_attention_call)
+    fwd_time_ms = do_bench(magi_attention_call)
     # torch._functorch.config.donated_buffer=False
     # Backward pass
-    block_out = block_attention_call()
+    block_out = magi_attention_call()[0]
     bwd_time_ms = do_bench(lambda: block_out.backward(gradOut, retain_graph=True))
     total_time_ms = fwd_time_ms + bwd_time_ms
 
@@ -172,7 +182,7 @@ def main():
     batch_size = 1
     sparsity_sampling_steps = 5
     # seqlen_vals = [1024,2048,4096,8192,16384,32768,65536,65536 * 2]
-    seqlen_vals = [8192,32768,65536 * 2]
+    seqlen_vals = [8192,16384, 32768,65536]
     headdim = 128
     dim = 4096
     dropout_p = 0.0
@@ -218,7 +228,7 @@ def main():
         content2=tabulate(results, headers=headers, tablefmt="tsv")
         print(content2)
         os.makedirs(f"{dtype}", exist_ok=True)
-        text_file = open(f"{dtype}/blockattention_{batch_size}_{seqlen}_{dim // headdim}_{headdim}.csv","w")
+        text_file = open(f"{dtype}/magiattention_{batch_size}_{seqlen}_{dim // headdim}_{headdim}.csv","w")
         text_file.write(content2)
         text_file.close()
     
