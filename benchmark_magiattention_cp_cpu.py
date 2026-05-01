@@ -23,7 +23,6 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from datetime import timedelta
 
-from magi_attention.benchmarking.bench import do_bench
 from sparsity_utils import ranges_block_sparsity
 
 from tabulate import tabulate
@@ -65,6 +64,7 @@ CHUNK_SIZE = 2048
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 16))
 CP_SIZE = WORLD_SIZE  # may differ from WORLD_SIZE when MP is enabled
 ITERATION = 40
+WARMUP = 5
 
 BENCH_MODE: Any = None
 ATTN_CONFIG: Any = None
@@ -129,7 +129,7 @@ def init_hierarchical_mesh(world_size: int,use_mp: bool):
 
             cp_group = device_mesh._flatten().get_group()
             cp_ranks = dist.get_process_group_ranks(cp_group)
-            print(f"[Rank {dist.get_rank()}] Mode: Normal Seq (CP2 Strided), CP group ranks: {cp_ranks}")
+            # print(f"[Rank {dist.get_rank()}] Mode: Normal Seq (CP2 Strided), CP group ranks: {cp_ranks}")
             return device_mesh
 
         device_mesh = init_device_mesh(
@@ -141,6 +141,198 @@ def init_hierarchical_mesh(world_size: int,use_mp: bool):
         device_mesh = None
 
     return device_mesh
+
+def do_bench_cpu(
+    fn,
+    warmup=5,
+    rep=40,
+    grad_to_none=None,
+    fast_flush=True,
+    return_mode="mean",
+):
+    """Benchmark the provided function with CPU timing (time.perf_counter).
+
+    Similar interface to do_bench but uses CPU wall-clock timing with
+    CUDA synchronize + dist.barrier between iterations, and all_reduce MAX
+    across ranks.
+
+    Args:
+        fn (Callable): Function to benchmark
+        warmup (int): Number of warmup iterations
+        rep (int): Number of repeat iterations
+        grad_to_none (list[torch.Tensor], optional): Reset gradients of these tensors to None
+        fast_flush (bool): Whether to use faster kernel to flush L2 between measurements
+        return_mode (str): Statistics mode, one of ["min", "max", "mean", "median"]
+
+    Returns:
+        float: Time in milliseconds (statistics according to return_mode)
+    """
+    assert return_mode in ["min", "max", "mean", "median"]
+
+    rank = int(os.environ.get("RANK", 0))
+
+    # L2 cache flush buffer
+    if fast_flush:
+        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
+    else:
+        cache = torch.empty(int(256e6), dtype=torch.int8, device="cuda")
+
+    warm_buf = torch.empty(int(256e6), dtype=torch.int8, device="cuda")
+    del warm_buf
+    torch.cuda.synchronize()
+
+    # Warmup
+    for _ in range(warmup):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                if x.grad is not None:
+                    x.grad = None
+        fn()
+        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
+
+    # Benchmark
+    times = []
+    for i in range(rep):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                if x.grad is not None:
+                    x.grad = None
+
+        # Flush L2 cache
+        cache.zero_()
+
+        # Synchronize before timing
+        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
+
+        # Time with CPU wall-clock
+        torch.cuda.nvtx.range_push(f"bench_iter{i}")
+        t0 = time.perf_counter()
+        fn()
+        if dist.is_initialized():
+            dist.barrier()
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        torch.cuda.nvtx.range_pop()
+
+        times.append(1000 * (t1 - t0))
+
+    # Final synchronization
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # Reduce-max across ranks
+    times_tensor = torch.tensor(times, dtype=torch.float32, device="cuda")
+    # print(f'cpu rank{rank}:{times_tensor}')
+    # print("-" * 50)
+    if dist.is_initialized():
+        dist.all_reduce(times_tensor, op=dist.ReduceOp.MAX)
+    times_tensor = times_tensor.to(device="cpu")
+    if(rank == 0):
+        print(f'cpu rank{rank}:{times_tensor}')
+    print("-" * 50)
+    # torch.cuda.empty_cache()
+    # gc.collect()
+
+    return getattr(torch, return_mode)(times_tensor).item()
+
+
+def do_bench_gpu(
+    fn,
+    warmup=5,
+    rep=40,
+    grad_to_none=None,
+    fast_flush=True,
+    return_mode="mean",
+):
+    """Benchmark the provided function with GPU timing (CUDA events).
+
+    Uses torch.cuda.Event for precise GPU-side timing, with L2 cache flush,
+    dist.barrier synchronization, and all_reduce MAX across ranks.
+
+    Args:
+        fn (Callable): Function to benchmark
+        warmup (int): Number of warmup iterations
+        rep (int): Number of repeat iterations
+        grad_to_none (list[torch.Tensor], optional): Reset gradients of these tensors to None
+        fast_flush (bool): Whether to use faster kernel to flush L2 between measurements
+        return_mode (str): Statistics mode, one of ["min", "max", "mean", "median"]
+
+    Returns:
+        float: Time in milliseconds (statistics according to return_mode)
+    """
+    assert return_mode in ["min", "max", "mean", "median"]
+
+    # L2 cache flush buffer
+    if fast_flush:
+        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
+    else:
+        cache = torch.empty(int(256e6), dtype=torch.int8, device="cuda")
+
+    # Warmup
+    for _ in range(warmup):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                if x.grad is not None:
+                    x.grad = None
+        fn()
+        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
+
+    # Pre-allocate CUDA events
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+
+    # Benchmark
+    for i in range(rep):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                if x.grad is not None:
+                    x.grad = None
+
+        # Flush L2 cache
+        cache.zero_()
+
+        # Synchronize before timing
+        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
+
+        # Time with CUDA events
+        torch.cuda.nvtx.range_push(f"bench_iter{i}")
+        start_events[i].record()
+        fn()
+        end_events[i].record()
+        torch.cuda.nvtx.range_pop()
+
+    # Wait for all events to complete
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # Compute GPU elapsed times
+    times = [start_events[i].elapsed_time(end_events[i]) for i in range(rep)]
+
+    # Reduce-max across ranks
+    rank = int(os.environ.get("RANK", 0))
+    times_tensor = torch.tensor(times, dtype=torch.float32, device="cuda")
+    # print(f'gpu rank{rank}:{times_tensor}')
+    # print("-" * 50)
+    if dist.is_initialized():
+        dist.all_reduce(times_tensor, op=dist.ReduceOp.MAX)
+    times_tensor = times_tensor.to(device="cpu")
+    # print(f'gpu rank{rank}:{times_tensor}')
+    # print("-" * 50)
+    # torch.cuda.empty_cache()
+    # gc.collect()
+
+    return getattr(torch, return_mode)(times_tensor).item()
+
 
 def run_magi_attn(
     total_seqlen: int,
@@ -158,6 +350,10 @@ def run_magi_attn(
     cp_mesh,
     iteration: int,
 ):
+    """Run MagiAttention distributed attention benchmark with CPU timing.
+
+    Uses time.perf_counter() for timing instead of do_bench.
+    """
 
     rank = int(os.environ.get("RANK", 0))
     device = torch.cuda.current_device()
@@ -293,31 +489,36 @@ def run_magi_attn(
     k_local.requires_grad_(True)
     v_local.requires_grad_(True)
     
-    # print(f"rank: {rank} | device: {device} pt2")
-
     if(rank == 0) :
-        # print("q_ranges:",q_ranges)
-        # print("k_ranges:",k_ranges)
-        # print("attn_mask_type:",attn_mask_type)
         print('q_local_shape:', q_local.shape)
         print(f'q_local_shape:{q_local.shape}, k_local_shape:{k_local.shape}, v_local_shape:{v_local.shape}, dout_local_shape:{dout_local.shape}')
-    # -----    forward   ---- #
-    
-    # -----    forward benchmark   ---- #
+
+    # -----    forward benchmark (CPU + GPU timing)   ---- #
     def fwd_fn():
         return calc_attn(q_local, k_local, v_local, magi_attn_runtime_key)
 
-    fwd_perf = do_bench(fwd_fn, return_flops=True, return_mem=False, warmup=5, rep=iteration)
-    fwd_time_ms = fwd_perf["flops"]
+    fwd_time_cpu = do_bench_cpu(fwd_fn, warmup=5, rep=iteration)
+    # fwd_time_gpu = do_bench_gpu(fwd_fn, warmup=5, rep=iteration)
 
-    # -----    backward benchmark   ---- #
+    # -----    backward benchmark (CPU + GPU timing)   ---- #
     out_local, _ = calc_attn(q_local, k_local, v_local, magi_attn_runtime_key)
 
     def bwd_fn():
         out_local.backward(dout_local, retain_graph=True)
 
-    bwd_perf = do_bench(bwd_fn, grad_to_none=[q_local, k_local, v_local], return_flops=True, return_mem=False, warmup=5, rep=iteration)
-    bwd_time_ms = bwd_perf["flops"]
+    bwd_time_cpu = do_bench_cpu(bwd_fn, grad_to_none=[q_local, k_local, v_local], warmup=5, rep=iteration)
+    # bwd_time_gpu = do_bench_gpu(bwd_fn, grad_to_none=[q_local, k_local, v_local], warmup=5, rep=iteration)
+
+    # # -----    Print CPU vs GPU timing comparison   ---- #
+    # if rank == 0:
+    #     print(f"  fwd: CPU={fwd_time_cpu:.3f}ms  GPU={fwd_time_gpu:.3f}ms  "
+    #           f"overhead={fwd_time_cpu - fwd_time_gpu:.3f}ms ({(fwd_time_cpu / fwd_time_gpu - 1) * 100:.1f}%)")
+    #     print(f"  bwd: CPU={bwd_time_cpu:.3f}ms  GPU={bwd_time_gpu:.3f}ms  "
+    #           f"overhead={bwd_time_cpu - bwd_time_gpu:.3f}ms ({(bwd_time_cpu / bwd_time_gpu - 1) * 100:.1f}%)")
+
+    # Use CPU timing as the primary result (includes sync/barrier overhead)
+    fwd_time_ms = fwd_time_cpu
+    bwd_time_ms = bwd_time_cpu
 
     # ----- undispatch ----- #
     _ = undispatch(out_local, magi_attn_runtime_key)
@@ -371,8 +572,6 @@ def copy_mask_for_batchs(q_ranges, k_ranges, is_causal_mapping, seqlen_qkv, bs):
         q_ranges_multi.extend(q_ranges_i)
         k_ranges_multi.extend(k_ranges_i)
         is_causal_mapping_multi.extend(is_causal_mapping_i)
-        # print(len(q_ranges_multi))
-        # print(q_ranges_multi)
     return q_ranges_multi, k_ranges_multi, is_causal_mapping_multi
 
 
@@ -395,21 +594,7 @@ def test_mask(
     else:
         data_type = torch.float16
 
-    #assert score_mod is not None or mask_mod is not None, "Must provide a score_mod or mask_mod"
-    # if mask_mod is not None:
-    #     block_mask = create_block_mask_cached(mask_mod, 1, 1, S, S, device=device)
-    # else:
-    #     block_mask = None
-
-    GQA_fac = 8
-    q = torch.randn(B * S, H * GQA_fac, D, device=device, dtype=data_type, requires_grad=True)
-    k = torch.randn(B * S, H, D, device=device, dtype=data_type, requires_grad=True)
-    v = torch.randn(B * S, H, D, device=device, dtype=data_type, requires_grad=True)
-    q.requires_grad_()
-    k.requires_grad_()
-    v.requires_grad_()
-    gradOut = torch.randn(B * S, H * GQA_fac, D, device=device, dtype=data_type)
-    
+    GQA_fac = 8    
     q_ranges ,k_ranges, attn_mask_type = mask_mod
 
     # Compute block sparsity from original (pre-batch-copy) ranges
@@ -462,18 +647,7 @@ def test_mask(
 
     return fwd_time_ms, bwd_time_ms, total_time_ms, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity
 
-    # np.save(f"tmp_res/q_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", q.view(torch.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/k_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", k.view(torch.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/v_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", v.view(torch.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/gradOut_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", gradOut.view(torch.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/magi_out_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", magi_out.type(torch.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/q_grad_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", q.grad.type(torch.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/k_grad_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", k.grad.type(torch.float32).detach().cpu().numpy())
-    # np.save(f"tmp_res/v_grad_{(int)(cur_num / total_num)}_{cur_num % total_num}.npy", v.grad.type(torch.float32).detach().cpu().numpy())
 
-    return fwd_time_ms, bwd_time_ms, total_time_ms
-    
-    
     
 def generate_prefix_lm_document_mask(doc_seq_lens=[2538, 1742, 3213]) -> tuple[list[list[int]], list[list[int]], list[int]]:
         """generate PREFIX LM DOCUMENT mask (prefix lm varlen)"""
@@ -612,16 +786,7 @@ def generate_full_mask(total_seqlen=7493) -> tuple[list[list[int]], list[list[in
 
 def _process_sequence_block(seqlens: list[int], cu_seqlens: list[int], cu_seqlens_offset: int, 
                            q_ranges: list[list[int]], k_ranges: list[list[int]], is_causal_mapping: list[bool]) -> None:
-    """处理单个文档序列块，生成对应的注意力掩码范围
-    
-    Args:
-        seqlens: 当前文档中各段的长度列表
-        cu_seqlens: 累计序列长度列表
-        cu_seqlens_offset: 当前文档在累计序列中的偏移量
-        q_ranges: 查询范围列表（会被修改）
-        k_ranges: 键范围列表（会被修改）
-        is_causal_mapping: 因果掩码标记列表（会被修改）
-    """
+    """处理单个文档序列块，生成对应的注意力掩码范围"""
     total_seqlen = sum(seqlens)
     for j in range(len(seqlens)):
         if j == 1:
@@ -637,29 +802,14 @@ def _process_sequence_block(seqlens: list[int], cu_seqlens: list[int], cu_seqlen
             is_causal_mapping.append(True)
 
 def _flatten_seqlens_and_compute_cu_seqlens(doc_seq_lens: list[list[int]]) -> tuple[list[int], list[int]]:
-    """扁平化文档序列长度并计算累计序列长度
-    
-    Args:
-        doc_seq_lens: 文档序列长度列表，每个元素是一个文档中各段的长度列表
-        
-    Returns:
-        tuple[list[int], list[int]]: (扁平化后的序列长度, 累计序列长度)
-    """
+    """扁平化文档序列长度并计算累计序列长度"""
     seqlens_flatten = [num for sublist in doc_seq_lens for num in sublist]
     cu_seqlens = seqlens2cu_seqlens(seqlens_flatten)
     return seqlens_flatten, cu_seqlens
 
 
 def generate_share_question_mask(doc_seq_lens=[2538, 1742, 3213]) -> tuple[list[list[int]], list[list[int]], list[bool]]:
-    """生成共享问题注意力掩码
-    
-    Args:
-        doc_seq_lens: 文档序列长度列表，每个元素是一个文档中各段的长度列表，默认值为[2538, 1742, 3213]
-        
-    Returns:
-        tuple[list[list[int]], list[list[int]], list[bool]]: 
-            (查询范围列表, 键范围列表, 因果掩码标记列表)
-    """
+    """生成共享问题注意力掩码"""
     seqlens_flatten, cu_seqlens = _flatten_seqlens_and_compute_cu_seqlens(doc_seq_lens)
 
     q_ranges: list[list[int]] = []
@@ -805,9 +955,6 @@ def load_py_as_dict(config_path: str) -> dict[str, Any]:
         raise ValueError(f"Failed to validate config: {str(e)}")
     
 def load_bench_config(config_file):
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--config", type=str, required=True)
-    # args = parser.parse_args()
     config_dict = load_py_as_dict(config_file)
 
     global BENCH_MODE, BENCH_CONFIG, ATTN_CONFIG, DATA_CONFIG, SAMPLE_CONFIG
@@ -826,7 +973,7 @@ def load_bench_config(config_file):
         os.makedirs(BENCH_CONFIG.output_path, exist_ok=True)
         
 def main(examples: List[str] = ["all"], dtype='bf16',config = "none", fast_eval=False):
-    """Run the benchmark with the given examples.
+    """Run the benchmark with the given examples using CPU timing.
 
     Args:
         examples: List of examples to run. If "all" is specified, all examples will be run.
@@ -840,10 +987,10 @@ def main(examples: List[str] = ["all"], dtype='bf16',config = "none", fast_eval=
     use_mp = WORLD_SIZE != CP_SIZE
     cp_mesh  = init_hierarchical_mesh(WORLD_SIZE, use_mp = use_mp)
     input_file = 'kernel_test_dist_seq_info.txt'
-    if(use_mp == True and fast_eval):
-        input_file = 'kernel_test_dist_seq_info-32k.txt'
-    elif fast_eval :
-        input_file = 'kernel_test_dist_seq_info-128k.txt'
+    # if(use_mp == True and fast_eval):
+    #     input_file = 'kernel_test_dist_seq_info-32k.txt'
+    # elif fast_eval :
+    #     input_file = 'kernel_test_dist_seq_info-128k.txt'
     with open(input_file, 'r') as f:
         for line in f:
             line = line.strip()
@@ -856,14 +1003,13 @@ def main(examples: List[str] = ["all"], dtype='bf16',config = "none", fast_eval=
                 qksparse_mask = eval(line.split(":")[-1].split("#")[1].strip())
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
             
-        #doc_seq_lens_list = doc_seq_lens_list[::-1]
         for H in [1]:
             D = 128
-            # print(doc_seq_lens_list)
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 2 if use_mp else 1
-                # H = 4
-
+                if(fast_eval):
+                    if(S // CP_SIZE != 16384):
+                        continue
                 doc_seq_lens = [x[1] for x in prefix_doc_seq_lens]
                 maskout_pair = []
                 offset = 0
@@ -877,21 +1023,11 @@ def main(examples: List[str] = ["all"], dtype='bf16',config = "none", fast_eval=
                         offset += doc_seq
 
                 share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
-                # print(share_qa_docs)
 
                 available_examples = {
-                    # "Full": lambda: test_mask(mask_mod=generate_full_mask(total_seqlen = S), B=B, S=S, H=H, D=D, dtype=dtype, cp_group = cp_group,cp_mesh = cp_mesh),
-                    # "Causal": lambda: test_mask(mask_mod=generate_causal_mask(total_seqlen = S), B=B, S=S, H=H, D=D, dtype=dtype, cp_group = cp_group,cp_mesh = cp_mesh),
-                    # "Sliding Window": lambda: test_mask(mask_mod=generate_sliding_window_mask(window_size=int(S*0.0625),total_seqlen = S), B=B, S=S, H=H, D=D, dtype=dtype, cp_group = cp_group,cp_mesh = cp_mesh),
                     "Causal Document Mask": lambda: test_mask(mask_mod=generate_causal_document_mask(doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype, cp_group = cp_group,cp_mesh = cp_mesh),
                     "Document Mask": lambda: test_mask(mask_mod=generate_document_mask(doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype, cp_group = cp_group,cp_mesh = cp_mesh),
-                    # "Share Question Mask": lambda: test_mask(mask_mod=generate_share_question_mask(doc_seq_lens=share_qa_docs), B=B, S=S, H=H, D=D, dtype=dtype, disable_fwd_atomic_reduction = True, cp_group = cp_group,cp_mesh = cp_mesh),
-                    # "Global Sliding Window": lambda: test_mask(mask_mod=generate_global_sliding_window_mask(global_token=16, window_size=int(S*0.0625), total_seqlen = S), B=B, S=S, H=H, D=D, dtype=dtype, disable_fwd_atomic_reduction = True, cp_group = cp_group,cp_mesh = cp_mesh),
-                    # "Causal Blockwise Mask": lambda: test_mask(mask_mod=generate_causal_blockwise_mask(doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype, cp_group = cp_group,cp_mesh = cp_mesh),
                     "Prefix LM Document Mask": lambda: test_mask(mask_mod=generate_prefix_lm_document_mask(doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype, cp_group = cp_group,cp_mesh = cp_mesh),
-                    # "Prefix LM Causal Mask": lambda: test_mask(mask_mod=generate_prefix_lm_causal_mask(seqlen=int(S*0.5),total_seqlen=S), B=B, S=S, H=H, D=D, dtype=dtype, cp_group = cp_group,cp_mesh = cp_mesh),
-                    # "QK-sparse Mask": lambda: test_mask(mask_mod=generate_qk_sparse_mask(maskout_pair=maskout_pair, total_seqlen=S), B=B, S=S, H=H, D=D, dtype=dtype, cp_group = cp_group,cp_mesh = cp_mesh),
-                    # "Random Eviction Mask": lambda: test_mask(mask_mod=generate_random_eviction_mask(start_row=S//2, total_seqlen=S), B=B, S=S, H=H, D=D, dtype=dtype, disable_fwd_atomic_reduction = True, cp_group = cp_group,cp_mesh = cp_mesh),
                 }
                 global total_num
                 total_num = len(available_examples)
@@ -933,8 +1069,8 @@ def main(examples: List[str] = ["all"], dtype='bf16',config = "none", fast_eval=
                 )
                 
                 content2=tabulate(results, headers=headers, tablefmt="tsv")
-                os.makedirs(f"{dtype}_dist_test", exist_ok=True)
-                text_file = open(f"{dtype}_dist_test/magiattention_{rank}_{CP_SIZE}_{B}_{S}_{H}_{D}_{idx}.csv","w")
+                os.makedirs(f"{dtype}_dist_test_cpu", exist_ok=True)
+                text_file = open(f"{dtype}_dist_test_cpu/magiattention_{rank}_{CP_SIZE}_{B}_{S}_{H}_{D}_{idx}.csv","w")
                 text_file.write(content2)
                 text_file.close()
 
@@ -944,7 +1080,7 @@ if __name__ == "__main__":
         from jsonargparse import ArgumentParser
     except ImportError:
         raise ImportError("Be sure to run: pip install -e .'[viz]'")
-    parser = ArgumentParser(description="Run specific examples or all examples.")
+    parser = ArgumentParser(description="Run specific examples or all examples with CPU timing.")
     parser.add_argument(
         "--examples",
         type=str,
@@ -975,4 +1111,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     load_bench_config(args.config)
     main(**vars(args))
-

@@ -17,7 +17,7 @@ from paddle.nn.functional.flash_attention import flashmask_attention
 from paddle.autograd.py_layer import PyLayer
 import numpy as np
 
-def scatter_balance(input_tensor, group=None, axis=0):
+def scatter_balance(input_tensor, group=None, axis=0, mode="dual_chunk", buckets=None):
     """
     Evenly split input tensor along the specified axis across model parallel ranks.
 
@@ -39,7 +39,7 @@ def scatter_balance(input_tensor, group=None, axis=0):
     """
     if group is None:
         hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = hcg.get_model_parallel_group()
 
     parallelism = group.nranks
     if parallelism == 1:
@@ -48,32 +48,72 @@ def scatter_balance(input_tensor, group=None, axis=0):
     rank = group.rank
     seq_len = input_tensor.shape[axis]
 
+    if(mode == "dual_chunk"):
     # Ensure sequence length is divisible by parallelism * 2 for balanced splitting
-    assert (
-        seq_len % (parallelism * 2) == 0
-    ), f"Input sequence length {seq_len} can't be divided exactly by sequence parallelism * 2 {parallelism * 2}"
+        assert (
+            seq_len % (parallelism * 2) == 0
+        ), f"Input sequence length {seq_len} can't be divided exactly by sequence parallelism * 2 {parallelism * 2}"
 
-    interval = seq_len // parallelism // 2
-    total_len = input_tensor.shape[axis]
+        interval = seq_len // parallelism // 2
+        total_len = input_tensor.shape[axis]
 
-    # Take chunk from the beginning
-    chunk_start = paddle.slice(input_tensor, axes=[axis], starts=[interval * rank], ends=[interval * (rank + 1)])
+        # Take chunk from the beginning
+        chunk_start = paddle.slice(input_tensor, axes=[axis], starts=[interval * rank], ends=[interval * (rank + 1)])
 
-    # Take chunk from the end (in reverse order)
-    chunk_end = paddle.slice(
-        input_tensor, axes=[axis], starts=[total_len - interval * (rank + 1)], ends=[total_len - interval * rank]
-    )
+        # Take chunk from the end (in reverse order)
+        chunk_end = paddle.slice(
+            input_tensor, axes=[axis], starts=[total_len - interval * (rank + 1)], ends=[total_len - interval * rank]
+        )
 
-    # Concatenate chunks
-    result = paddle.concat([chunk_start, chunk_end], axis=axis)
-
+        # Concatenate chunks
+        result = paddle.concat([chunk_start, chunk_end], axis=axis)
+    elif(mode == "balanced_swap"):
+        assert buckets is not None, "buckets must be provided when mode is balanced_swap"
+        assert len(buckets) == parallelism, "buckets should have same size as parallelism"
+        assert seq_len % (parallelism * len(buckets[rank])) == 0, "seq_len must be divisible by parallelism * len(buckets[rank])"
+        local_chunks = []
+        balance_chunksize = seq_len // (parallelism * len(buckets[rank]))
+        for(_, idx) in buckets[rank]:
+            # 切分轴的start和end
+            chunk_start = idx * balance_chunksize
+            chunk_end = (idx + 1) * balance_chunksize
+            chunk = paddle.slice(input_tensor, axes=[axis], starts=chunk_start, ends=chunk_end)
+            local_chunks.append(chunk)
+        result = paddle.concat(local_chunks, axis=axis)
     # Use assign to free the memory of the whole input tensor to avoid OOM
-    # since slice uses stride and maintains reference to original tensor
+    # since slice uses stride and maintains reference to original tensor        
     result = paddle.assign(result)
     return result
 
+def all_gather_order(input_tensor, group=None, axis=0):
+    """
+    All-gather operation to reconstruct the original tensor from ordered scattered chunks.
 
-def all_gather_balance(input_tensor, group=None, axis=0):
+    Args:
+        input_tensor (paddle.Tensor): Input tensor chunk
+        group (paddle.distributed.Group, optional): Communication group
+        axis (int, optional): Axis along which to gather. Defaults to 0
+
+    Returns:
+        paddle.Tensor: Reconstructed full tensor
+    """
+    if group is None:
+        hcg = fleet.get_hybrid_communicate_group()
+        group = hcg.get_model_parallel_group()
+
+    parallelism = group.nranks
+    if parallelism == 1:
+        return input_tensor.clone()
+
+    # Create a list to hold gathered chunks
+    gathered_list = [paddle.empty(input_tensor.shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
+    dist.stream.all_gather(gathered_list, input_tensor, group=group, use_calc_stream=True)
+
+    # Concatenate in order
+    result = paddle.concat(gathered_list, axis=axis)
+    return result
+
+def all_gather_balance(input_tensor, group=None, axis=0, mode="dual_chunk", buckets=None):
     """
     All-gather operation with balanced reconstruction.
 
@@ -90,44 +130,68 @@ def all_gather_balance(input_tensor, group=None, axis=0):
     """
     if group is None:
         hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = hcg.get_model_parallel_group()
 
     parallelism = group.nranks
     if parallelism == 1:
         return input_tensor.clone()
 
-    # Split input into two halves (start and end chunks)
-    chunk_start, chunk_end = paddle.split(input_tensor, 2, axis=axis)
+    if(mode == "dual_chunk"):
+        # Split input into two halves (start and end chunks)
+        chunk_start, chunk_end = paddle.split(input_tensor, 2, axis=axis)
 
-    if axis == 0:
-        # Handle axis=0 case with optimized memory layout
-        output_shape_start = list(chunk_start.shape)
-        output_shape_start[axis] = output_shape_start[axis] * parallelism
+        if axis == 0:
+            # Handle axis=0 case with optimized memory layout
+            output_shape_start = list(chunk_start.shape)
+            output_shape_start[axis] = output_shape_start[axis] * parallelism
 
-        gathered_start = paddle.empty(shape=output_shape_start, dtype=input_tensor.dtype)
-        dist.stream.all_gather(gathered_start, chunk_start, group=group, use_calc_stream=True)
+            gathered_start = paddle.empty(shape=output_shape_start, dtype=input_tensor.dtype)
+            dist.stream.all_gather(gathered_start, chunk_start, group=group, use_calc_stream=True)
 
-        # Gather end chunks
-        gathered_end_list = [paddle.empty(chunk_end.shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
-        dist.stream.all_gather(gathered_end_list, chunk_end, group=group, use_calc_stream=True)
+            # Gather end chunks
+            gathered_end_list = [paddle.empty(chunk_end.shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
+            dist.stream.all_gather(gathered_end_list, chunk_end, group=group, use_calc_stream=True)
 
-        # Reverse the end chunks to reconstruct original order
-        gathered_end_list = gathered_end_list[::-1]
+            # Reverse the end chunks to reconstruct original order
+            gathered_end_list = gathered_end_list[::-1]
 
-        result = paddle.concat([gathered_start] + gathered_end_list, axis=axis)
-        return result
-    else:
-        # Handle other axes
-        gathered_start_list = [paddle.empty(chunk_start.shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
-        dist.stream.all_gather(gathered_start_list, chunk_start, group=group, use_calc_stream=True)
+            result = paddle.concat([gathered_start] + gathered_end_list, axis=axis)
+            return result
+        else:
+            # Handle other axes
+            gathered_start_list = [paddle.empty(chunk_start.shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
+            dist.stream.all_gather(gathered_start_list, chunk_start, group=group, use_calc_stream=True)
 
-        gathered_end_list = [paddle.empty(chunk_end.shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
-        dist.stream.all_gather(gathered_end_list, chunk_end, group=group, use_calc_stream=True)
+            gathered_end_list = [paddle.empty(chunk_end.shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
+            dist.stream.all_gather(gathered_end_list, chunk_end, group=group, use_calc_stream=True)
 
-        # Reverse the end chunks
-        gathered_end_list = gathered_end_list[::-1]
+            # Reverse the end chunks
+            gathered_end_list = gathered_end_list[::-1]
 
-        result = paddle.concat(gathered_start_list + gathered_end_list, axis=axis)
+            result = paddle.concat(gathered_start_list + gathered_end_list, axis=axis)
+            return result
+    elif(mode == "balanced_swap"):
+        assert buckets is not None, "buckets must be provided when mode is balanced_swap"
+        assert len(buckets) == parallelism, "buckets should have same size as parallelism"
+        chunk_shape = input_tensor.shape
+        chunk_size = chunk_shape[axis] // len(buckets[0])
+        gathered_list = [paddle.empty(chunk_shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
+        dist.stream.all_gather(gathered_list, input_tensor, group=group, use_calc_stream=True)
+        
+        total_shape = chunk_shape[:axis] + (chunk_shape[axis] * parallelism,) + chunk_shape[axis + 1 :]
+        gathered_tensor = paddle.zeros(total_shape, dtype=input_tensor.dtype)
+        for j in range(parallelism):
+            for k in range(len(buckets[j])):
+                _, idx = buckets[j][k]
+                start_idx_total = idx * chunk_size
+                end_idx_total = (idx + 1) * chunk_size
+                slices_total = [slice(None)] * len(gathered_tensor.shape)
+                slices_total[axis] = slice(start_idx_total, end_idx_total)
+                
+                slices_chunk = [slice(None)] * len(gathered_list[j].shape)
+                slices_chunk[axis] = slice(k*chunk_size, (k+1)*chunk_size)
+                gathered_tensor[tuple(slices_total)] = gathered_list[j][tuple(slices_chunk)]
+        result = gathered_tensor
         return result
 
 
@@ -165,7 +229,7 @@ def reduce_scatter_any_axis(input_tensor, axis, group=None):
         output_shape[0] = output_shape[0] // parallelism
 
         output = paddle.empty(shape=output_shape, dtype=input_tensor.dtype)
-        dist.stream.reduce_scatter(output, input_tensor, op=dist.ReduceOp.SUM, group=group, use_calc_stream=False)
+        dist.stream.reduce_scatter(output, input_tensor, op=dist.ReduceOp.SUM, group=group, use_calc_stream=True)
         return output
     else:
         # General case for other axes using alltoall
@@ -173,7 +237,7 @@ def reduce_scatter_any_axis(input_tensor, axis, group=None):
 
         output_buffers = [paddle.empty(input_chunks[0].shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
 
-        dist.stream.alltoall(output_buffers, input_chunks, group=group, use_calc_stream=False)
+        dist.stream.alltoall(output_buffers, input_chunks, group=group, use_calc_stream=True)
 
         # Sum the received chunks
         result = paddle.stack(output_buffers, axis=0).sum(axis=0)
@@ -225,7 +289,6 @@ def reduce_scatter_any_axis_balance(input_tensor, axis, group=None):
 
     # Perform alltoall communication
     output_buffers = [paddle.empty(combined_chunks[0].shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
-    
 
     dist.stream.alltoall(output_buffers, combined_chunks, group=group, use_calc_stream=True)
 
@@ -233,6 +296,44 @@ def reduce_scatter_any_axis_balance(input_tensor, axis, group=None):
     result = paddle.stack(output_buffers, axis=0).sum(axis=0)
     return result
 
+def reduce_scatter_any_axis_order(input_tensor, axis, group=None):
+    """
+    Ordered reduce-scatter operation along any axis.
+
+    Splits the input tensor sequentially along the specified axis,
+    sends corresponding chunks to each rank, and sums the received chunks.
+
+    Args:
+        input_tensor (paddle.Tensor): Input tensor to reduce and scatter
+        axis (int): Axis along which to perform reduce-scatter
+        group (paddle.distributed.Group, optional): Communication group
+
+    Returns:
+        paddle.Tensor: Reduced and scattered tensor chunk with ordered distribution
+    """
+    if group is None:
+        hcg = fleet.get_hybrid_communicate_group()
+        group = hcg.get_context_parallel_group()
+
+    parallelism = group.nranks
+    if parallelism == 1:
+        return input_tensor.clone()
+
+    assert input_tensor.shape[axis] % parallelism == 0, (
+        f"Input sequence length {input_tensor.shape[axis]} can't be "
+        f"divided exactly by context parallelism {parallelism}",
+    )
+
+    # Split input into chunks along the axis (sequentially, no reverse)
+    chunks = paddle.split(input_tensor, parallelism, axis=axis)
+
+    # Perform alltoall communication
+    output_buffers = [paddle.empty(chunks[0].shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
+    dist.stream.alltoall(output_buffers, chunks, group=group, use_calc_stream=True)
+
+    # Sum the received chunks
+    result = paddle.stack(output_buffers, axis=0).sum(axis=0)
+    return result
 
 class ContextParallelScatterOp(PyLayer):
     """
@@ -446,7 +547,7 @@ def preprocess_index_dual_chunks(startend_row_indices, chunk_id_first, chunk_id_
     return combined_indices
 
 
-def cp_flashmask_allgatherkv_balance_forward(query, key, value, startend_row_indices, group, causal, is_training):
+def cp_flashmask_allgatherkv_balance_forward(query, key, value, startend_row_indices, group, causal, is_training, mode):
     """
     Forward pass of context parallel flashmask attention with balanced all-gather strategy.
 
@@ -471,22 +572,28 @@ def cp_flashmask_allgatherkv_balance_forward(query, key, value, startend_row_ind
     cp_size = group.world_size
 
     # All-gather key tensors across context parallel ranks
-    key_gathered = all_gather_balance(key, axis=1, group=group)
+    if(mode == "allgather_kv"):
+        key_gathered = all_gather_balance(key, axis=1, group=group)
 
-    # All-gather value tensors across context parallel ranks
-    value_gathered = all_gather_balance(value, axis=1, group=group)
+        # All-gather value tensors across context parallel ranks
+        value_gathered = all_gather_balance(value, axis=1, group=group)
 
-    # Calculate sequence block size for dual-chunk strategy
-    seq_blocksize = query.shape[1] // 2
+        # Calculate sequence block size for dual-chunk strategy
+        seq_blocksize = query.shape[1] // 2
 
-    # Preprocess indices for dual-chunk strategy
-    startend_row_indices = preprocess_index_dual_chunks(
-        startend_row_indices,
-        chunk_id_first=rank,
-        chunk_id_second=2 * cp_size - rank - 1,
-        seq_blocksize=seq_blocksize,
-        max_seqlen_q=seq_blocksize,
-    )
+        # Preprocess indices for dual-chunk strategy
+        startend_row_indices = preprocess_index_dual_chunks(
+            startend_row_indices,
+            chunk_id_first=rank,
+            chunk_id_second=2 * cp_size - rank - 1,
+            seq_blocksize=seq_blocksize,
+            max_seqlen_q=seq_blocksize,
+        )
+    elif(mode == "balance_q"):       
+        key_gathered = all_gather_order(key, axis=1, group=group)
+        
+        value_gathered = all_gather_order(value, axis=1, group=group)
+        
 
     # Perform flashmask attention with startend_row_indices
     output, log_sum_exp = flashmask_attention(
@@ -504,7 +611,7 @@ def cp_flashmask_allgatherkv_balance_forward(query, key, value, startend_row_ind
 
 
 def cp_flashmask_allgatherkv_balance_backward(
-    query, key, value, startend_row_indices, output, log_sum_exp, output_grad, group, causal
+    query, key, value, startend_row_indices, output, log_sum_exp, output_grad, group, causal, mode
 ):
     """
     Backward pass of context parallel flashmask attention with balanced all-gather strategy.
@@ -530,14 +637,15 @@ def cp_flashmask_allgatherkv_balance_backward(
 
     cp_size = group.world_size
 
-    # All-gather key and value tensors (same as forward pass)
-    key_gathered = all_gather_balance(key, axis=1, group=group)
-    value_gathered = all_gather_balance(value, axis=1, group=group)
-    
-    x_np = startend_row_indices.numpy()
-    rank = dist.get_rank()
-    np.savetxt(f'tensor_{rank}.txt', x_np.reshape(-1, x_np.shape[-1]), fmt='%d')
-    print(f'rank:{rank} ,qshape:{query.shape}, kshape:{key.shape}, vshape:{value.shape}')
+    if(mode == "allgather_kv"):
+        # All-gather key and value tensors (same as forward pass)
+        key_gathered = all_gather_balance(key, axis=1, group=group)
+        value_gathered = all_gather_balance(value, axis=1, group=group)
+    elif(mode == "balance_q"):
+        key_gathered = all_gather_order(key, axis=1, group=group)
+        value_gathered = all_gather_order(value, axis=1, group=group)
+    else:
+        raise NotImplementedError
 
     if paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"]:
         fa_version = 2
@@ -575,17 +683,16 @@ def cp_flashmask_allgatherkv_balance_backward(
         )
     else:
         raise ValueError(f"FlashAttention version {fa_version} is not supported.")
-    
-    paddle.device.synchronize()
-    
-    rank = group.rank
-    print(f"rank:{rank} pass backward")
 
     # Reduce-scatter key and value gradients
-    key_grad = reduce_scatter_any_axis_balance(key_grad_gathered, axis=1, group=group)
-    print(f"rank:{rank} pass key scatter")
-    value_grad = reduce_scatter_any_axis_balance(value_grad_gathered, axis=1, group=group)
-    print(f"rank:{rank} pass value scatter")
+    if(mode == "allgather_kv"):
+        key_grad = reduce_scatter_any_axis_balance(key_grad_gathered, axis=1, group=group)
+        value_grad = reduce_scatter_any_axis_balance(value_grad_gathered, axis=1, group=group)
+    elif(mode == "balance_q"):
+        key_grad = reduce_scatter_any_axis_order(key_grad_gathered, axis=1, group=group)
+        value_grad = reduce_scatter_any_axis_order(value_grad_gathered, axis=1, group=group)
+    else:
+        raise NotImplementedError
 
     paddle.base.core.nvprof_nvtx_pop()
     return query_grad, key_grad, value_grad
@@ -613,7 +720,7 @@ class FlashMaskContextParallel(PyLayer):
         dropout=0.0,
         causal=False,
         training=True,
-        mode="allgather_kv",
+        mode="allgather_kv"
     ):
         """
         Forward pass of FlashMask attention with context parallelism.
@@ -659,14 +766,20 @@ class FlashMaskContextParallel(PyLayer):
         )
 
         # Perform forward pass
+        rank= paddle.distributed.get_rank()
+        print(f"{rank} before fwd")
         output, log_sum_exp, startend_row_indices = cp_flashmask_allgatherkv_balance_forward(
-            query, key, value, startend_row_indices, group, causal, training
+            query, key, value, startend_row_indices, group, causal, training, mode
         )
+        print(f"{rank} pass fwd")
 
         # Save tensors for backward pass
         ctx.save_for_backward(query, key, value, output, log_sum_exp, startend_row_indices)
+        # rank1 = paddle.distributed.get_rank()
+        # paddle.save(startend_row_indices,f'/root/paddlejob/workspace/env_run/xiehaoyang/flashmask/flashmask-cp/test_indices/startend_row_indices_balance_{rank1}.pd')
         ctx.group = group
         ctx.causal = causal
+        ctx.mode = mode
 
         return output
 
@@ -686,11 +799,14 @@ class FlashMaskContextParallel(PyLayer):
         query, key, value, output, log_sum_exp, startend_row_indices = ctx.saved_tensor()
         group = ctx.group
         causal = ctx.causal
+        mode = ctx.mode
 
         # Compute gradients
+        # print(f"{rank} before bwd")
         query_grad, key_grad, value_grad = cp_flashmask_allgatherkv_balance_backward(
-            query, key, value, startend_row_indices, output, log_sum_exp, output_grad, group, causal
+            query, key, value, startend_row_indices, output, log_sum_exp, output_grad, group, causal, mode
         )
+        # print(f"{rank} pass bwd")
 
         return query_grad, key_grad, value_grad
 
@@ -704,7 +820,7 @@ def flashmask_attention_cp(
     dropout=0.0,
     causal=False,
     training=True,
-    mode="allgather_kv",
+    mode="allgather_kv"
 ):
     """
     FlashMask attention with context parallelism - public API.
@@ -744,6 +860,7 @@ def flashmask_attention_cp(
         )
         ```
     """
+    print("enter")
     output = FlashMaskContextParallel.apply(
         query,
         key,
@@ -753,6 +870,6 @@ def flashmask_attention_cp(
         dropout,
         causal,
         training,
-        mode,
+        mode
     )
     return output

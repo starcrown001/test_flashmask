@@ -19,6 +19,7 @@ from magi_attention.common.range import AttnRange
 from magi_attention.common.ranges import AttnRanges
 
 from triton.testing import do_bench
+from sparsity_utils import ranges_block_sparsity
 
 torch.set_default_device("cuda")
 torch.manual_seed(0)
@@ -145,24 +146,8 @@ def test_mask(
     magi_attention_call = lambda: ffa_func(q, k, v, q_ranges_tensor, k_ranges_tensor, attn_mask_type_tensor, disable_fwd_atomic_reduction = disable_fwd_atomic_reduction)
 
     results = []
-    q_ranges_: AttnRanges = AttnRanges.from_ranges(ranges=q_ranges)
-    k_ranges_: AttnRanges = AttnRanges.from_ranges(ranges=k_ranges)
-    attn_mask_type_: list[AttnMaskType] = [
-        [
-            AttnMaskType.FULL,
-            AttnMaskType.CAUSAL,
-            AttnMaskType.INVCAUSAL,
-            AttnMaskType.BICAUSAL,
-        ][mask_idx]
-        for mask_idx in attn_mask_type
-    ]
-    sparsity = calculate_sparsity(q_ranges_, k_ranges_, attn_mask_type_, S, S)
-    if mask_mod is not None:
-        density = 1.0 - sparsity
-    else:
-        density = 1.0
-
-    ç = 1.0 - density
+    sparsity = ranges_block_sparsity(q_ranges, k_ranges, attn_mask_type, S, S)
+    density = 1.0 - sparsity
 
     # Forward pass
     fwd_time_ms = do_bench(magi_attention_call)
@@ -264,11 +249,11 @@ def generate_global_sliding_window_mask(global_token = 16, window_size = 4096, t
 
         q_ranges.append([0, total_seqlen])
         k_ranges.append([0, window_size_single])
-        attn_type_map.append(1)
+        attn_type_map.append(0)
 
         q_ranges.append([0, window_size_single])
         k_ranges.append([window_size_single, total_seqlen])
-        attn_type_map.append(1)
+        attn_type_map.append(0)
 
         (
             sw_q_ranges,

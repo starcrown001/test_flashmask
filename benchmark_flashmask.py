@@ -367,13 +367,17 @@ def generate_document_mask(B, S, H, D, doc_seq_lens=[2538, 1742, 3213]):
     for i in range(len(doc_seq_lens)):
         up_right_row_indices.extend([cur_len_so_far] * doc_seq_lens[i])
         if i < len(doc_seq_lens) -1:
-            cur_len_so_far += doc_seq_lens[i+1]
+            cur_len_so_far += doc_seq_lens[i]
     if padding > 0:
         up_right_row_indices.extend([cur_len_so_far] * padding)
     
     down_left_row_indices = paddle.to_tensor(down_left_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
     up_right_row_indices = paddle.to_tensor(up_right_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
     startend_row_indices = paddle.concat([down_left_row_indices, up_right_row_indices], axis=-1)
+    
+    # paddle.set_printoptions(precision=None, threshold=100000, edgeitems=None, sci_mode=None, linewidth=None)
+    # print(startend_row_indices)
+    # assert False
     
     causal = False
     return startend_row_indices, causal
@@ -606,8 +610,8 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
             H = 4096 // D
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 1
-                if(S >  64 * 1024 ):
-                    continue
+                # if(S >  64 * 1024 ):
+                #     continue
 
                 doc_seq_lens = [x[1] for x in prefix_doc_seq_lens]
                 maskout_pair = []

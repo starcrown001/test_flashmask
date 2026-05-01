@@ -7,23 +7,29 @@ import os
 import paddle.nn.functional as F
 from paddle.nn.functional.flash_attention import flashmask_attention
 from context_parallel_utils import flashmask_attention_cp
-from sparsity_utils import flashmask_block_sparsity
 
 import paddle.distributed.fleet as fleet
 import time
 
 import numpy as np
 
-cp_size = int(os.environ.get("CP_SIZE", 16))
+# cp_size = 16
+# mp_size = 1
+# sd_size = 16
+
+cp_size = 4
+mp_size = 4
+sd_size = 4
+
 strategy = fleet.DistributedStrategy()
 
 strategy.hybrid_configs = {
   "dp_degree": 1,
-  "mp_degree": 1,
+  "mp_degree": mp_size,
   "pp_degree": 1,
-  "sharding_degree": cp_size,
+  "sharding_degree": sd_size,
   "sep_degree": 1,
-  "ep_degree":  cp_size,
+  "ep_degree":  16,
   "moe_sharding_degree": 1,
   "cp_degree": cp_size,
   "order": ["sharding", "moe_sharding", "pp", "sep", "cp", "dp", "ep", "mp"]
@@ -72,124 +78,107 @@ def split_sequence(sequence_length, num_answers=2):
 
     return lengths
 
-def do_bench_flashmaskcp(q_local, k_local, v_local, o_grad_local, startend_row_indices, group, is_causal, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
+def do_bench_flashmaskcp(q_local, k_local, v_local, o_grad_local, startend_row_indices, group, is_causal, warmup=3, rep=5, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
     """
-    Benchmark the runtime of the provided function using CUDA event-based timing.
+    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
+    the 20-th and 80-th performance percentile.
 
-    :param warmup: Number of warmup iterations
+    :param fn: Function to benchmark
+    :type fn: Callable
+    :param warmup: Warmup time (in ms)
     :type warmup: int
-    :param rep: Number of repetition iterations
+    :param rep: Repetition time (in ms)
     :type rep: int
     :param grad_to_none: Reset the gradient of the provided tensor to None
-    :type grad_to_none: paddle.Tensor, optional
+    :type grad_to_none: torch.tensor, optional
     :param quantiles: Performance percentile to return in addition to the median.
     :type quantiles: list[float], optional
     :param fast_flush: Use faster kernel to flush L2 cache between measurements
     :type fast_flush: bool, default is True
-    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median".
-    :type return_mode: str
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".    :type return_mode: str
     """
-    assert return_mode in ["min", "max", "mean", "median"]
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+    print(f"wsm debug {q_local.shape=}, {k_local.shape=}, {v_local.shape=}")
+    paddle.base.core.nvprof_nvtx_push("paddle")
 
-    # Initial run to ensure correctness and warm up CUDA context
     out_local = flashmask_attention_cp(q_local, k_local, v_local, startend_row_indices, causal=is_causal)
+    # print('pt00')
     out_local.backward(o_grad_local)
-    paddle.distributed.barrier(group=cp_group)
+    # print('pt0')
     paddle.device.synchronize()
+    paddle.distributed.barrier(group=cp_group)
+    # print('here')
 
     # We maintain a buffer of 256 MB that we clear
     # before each kernel call to make sure that the L2 cache
     # doesn't contain any input data before the run
+    cache_size = 256 * 1024 * 1024
     if fast_flush:
-        cache = paddle.empty([int(256e6 // 4)], dtype=paddle.int32)
+        cache = paddle.empty([int(cache_size // 4)], dtype=paddle.int32)
     else:
-        cache = paddle.empty([int(256e6)], dtype=paddle.int8)
+        cache = paddle.empty([int(cache_size)], dtype=paddle.int8)
 
-    n_warmup = warmup
-    n_repeat = rep
-
-    # Create CUDA events for fwd and bwd timing per iteration
-    fwd_start_event = [paddle.device.Event(enable_timing=True) for _ in range(n_repeat)]
-    fwd_end_event = [paddle.device.Event(enable_timing=True) for _ in range(n_repeat)]
-    bwd_start_event = [paddle.device.Event(enable_timing=True) for _ in range(n_repeat)]
-    bwd_end_event = [paddle.device.Event(enable_timing=True) for _ in range(n_repeat)]
-
-    # Warm-up
-    for _ in range(n_warmup):
+    # Estimate the runtime of the function
+    start_event = paddle.device.Event(enable_timing=True)
+    end_event = paddle.device.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(5):
+        # cache.zero_()
+        time.sleep(0.1)
         out_local = flashmask_attention_cp(q_local, k_local, v_local, startend_row_indices, causal=is_causal)
         out_local.backward(o_grad_local)
-    paddle.distributed.barrier(group=cp_group)
+        paddle.device.synchronize()
+        paddle.distributed.barrier(group=cp_group)
+    end_event.record()
     paddle.device.synchronize()
+    paddle.distributed.barrier(group=cp_group)
+    estimate_ms = start_event.elapsed_time(end_event) / 5
 
-    # Use all_reduce as barrier before benchmark
-    paddle.distributed.all_reduce(cache, op=paddle.distributed.ReduceOp.SUM, group=cp_group)
-
+    # print('pt2')
+    # compute number of warmup and repeat
+    n_warmup = max(3, int(warmup / estimate_ms))
+    n_repeat = max(5, int(rep / estimate_ms))
+    start_event = [paddle.device.Event(enable_timing=True) for i in range(n_repeat)]
+    end_event = [paddle.device.Event(enable_timing=True) for i in range(n_repeat)]
+    # Warm-up
+    for _ in range(n_warmup):
+        time.sleep(0.1)
+        out_local =flashmask_attention_cp(q_local, k_local, v_local, startend_row_indices, causal=is_causal)
+        out_local.backward(o_grad_local, retain_graph=True)
+        paddle.device.synchronize()
+        paddle.distributed.barrier(group=cp_group)
     # Benchmark
+    times_fwd = []
+    times_bwd = []
     for i in range(n_repeat):
+        time.sleep(0.1)
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
-        # Clear L2 cache
-        cache.zero_()
-
-        # Barrier before each iteration
-        paddle.distributed.all_reduce(cache, op=paddle.distributed.ReduceOp.SUM, group=cp_group)
-
-        # Forward timing
-        fwd_start_event[i].record()
+        paddle.device.synchronize()
+        paddle.distributed.barrier(group=cp_group)
+        t0 = time.perf_counter()
         out_local = flashmask_attention_cp(q_local, k_local, v_local, startend_row_indices, causal=is_causal)
-        fwd_end_event[i].record()
-
-        # Backward timing
-        bwd_start_event[i].record()
-        out_local.backward(o_grad_local)
-        bwd_end_event[i].record()
-
-    # Final barrier
-    paddle.distributed.all_reduce(cache, op=paddle.distributed.ReduceOp.SUM, group=cp_group)
-
-    # Synchronize and compute times from CUDA events
+        paddle.device.synchronize()
+        paddle.distributed.barrier(group=cp_group)
+        t1 = time.perf_counter()
+        out_local.backward(o_grad_local, retain_graph=True)
+        paddle.device.synchronize()
+        paddle.distributed.barrier(group=cp_group)
+        t2 = time.perf_counter()
+        times_fwd.append(1000 * (t1 - t0))
+        times_bwd.append(1000 * (t2 - t1))
+        
+    # Record clocks
     paddle.device.synchronize()
-    fwd_times = paddle.to_tensor(
-        [s.elapsed_time(e) for s, e in zip(fwd_start_event, fwd_end_event)],
-        dtype=paddle.float32,
-    )
-    bwd_times = paddle.to_tensor(
-        [s.elapsed_time(e) for s, e in zip(bwd_start_event, bwd_end_event)],
-        dtype=paddle.float32,
-    )
-
-    # Synchronize times across ranks (take max across all ranks)
-    paddle.distributed.all_reduce(fwd_times, op=paddle.distributed.ReduceOp.MAX, group=cp_group)
-    paddle.distributed.all_reduce(bwd_times, op=paddle.distributed.ReduceOp.MAX, group=cp_group)
-
-    fwd_times = fwd_times.cpu()
-    bwd_times = bwd_times.cpu()
-
-    if quantiles is not None:
-        fwd_ret = paddle.quantile(fwd_times, paddle.to_tensor(quantiles, dtype=paddle.float32)).tolist()
-        bwd_ret = paddle.quantile(bwd_times, paddle.to_tensor(quantiles, dtype=paddle.float32)).tolist()
-        if len(fwd_ret) == 1:
-            fwd_ret = fwd_ret[0]
-        if len(bwd_ret) == 1:
-            bwd_ret = bwd_ret[0]
-        return fwd_ret, bwd_ret
-
-    fwd_stat = getattr(paddle, return_mode)(fwd_times).item()
-    bwd_stat = getattr(paddle, return_mode)(bwd_times).item()
-    return fwd_stat, bwd_stat
+    paddle.distributed.barrier(group=cp_group)
+    # print('pt3')
+    return sum(times_fwd) / n_repeat, sum(times_bwd) / n_repeat
     
-def cal_flops(B, H, Sq, Sk, D, mode='fwd'):
-    assert mode in ["fwd", "bwd", "fwd_bwd"]
-    f = 4 * B * Sq * Sk * H * D
-    return f if mode == "fwd" else (2.5 * f if mode == "bwd" else 3.5 * f)
-
-def cal_tflops(flops, time_ms):
-    return  flops * (1e3 / time_ms) / 1e12
-
 def cp_flashmask_balance_bench(q, k, v, startend_row_indices, is_causal,o_grad):
     group = cp_group
-    rank = paddle.distributed.get_rank()
+    # rank = paddle.distributed.get_rank()
+    rank = paddle.distributed.get_rank(group=cp_group)
     q_blocksize = (int)(q.shape[1] // (2 * cp_size))
     k_blocksize = (int)(k.shape[1] // cp_size)
     q_local_1 = q[:, rank*q_blocksize:(rank+1)*q_blocksize, :, :]
@@ -243,12 +232,13 @@ def test_cp_famask(
     total_k = S
     batch_size = B
     num_head = H
+    num_head_q = H
     head_size = D
     # total_k = total_q * 2
-    query = paddle.randn([batch_size, total_q, num_head, head_size], dtype=paddle.bfloat16) 
+    query = paddle.randn([batch_size, total_q, num_head_q, head_size], dtype=paddle.bfloat16) 
     key = paddle.randn([batch_size, total_k, num_head, head_size], dtype=paddle.bfloat16)
     value = paddle.randn([batch_size, total_k, num_head, head_size], dtype=paddle.bfloat16)
-    o_grad = paddle.randn([batch_size, total_q, num_head, head_size], dtype=paddle.bfloat16)
+    o_grad = paddle.randn([batch_size, total_q, num_head_q, head_size], dtype=paddle.bfloat16)
     query.stop_gradient = False
     key.stop_gradient = False
     value.stop_gradient = False
@@ -258,27 +248,28 @@ def test_cp_famask(
         print("enter",generate_mask_fn)
         startend_row_indices, causal = generate_mask_fn(batch_size, total_q, num_head, head_size)
         # startend_row_indices, causal = generate_mask_fn(total_q)
+
+    print(f"wsm debug {query.shape=}, {key.shape=}, {value.shape=}, {startend_row_indices.shape=}, {causal=}")
         
     # print(startend_row_indices)
     # paddle.set_printoptions(precision=None, threshold=10000000, edgeitems=None, sci_mode=None, linewidth=None)
 
     fwd_time, bwd_time = cp_flashmask_balance_bench(query, key, value, startend_row_indices, causal,o_grad)
     paddle.device.synchronize()
-
+    # out1.backward(o_grad1)
+    # paddle.device.synchronize()
+    
+    # print("pypt2:")
+    # print(startend_row_indices)
     total_time = fwd_time + bwd_time
-
-    sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, S)
-    density = 1.0 - sparsity
-
-    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd') / cp_size
-    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd') / cp_size
-    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd') / cp_size
-
-    fwd_tflops = cal_tflops(fwd_flops, fwd_time)
-    bwd_tflops = cal_tflops(bwd_flops, bwd_time)
-    total_tflops = cal_tflops(total_flops, total_time)
-
-    return fwd_time, bwd_time, total_time, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity
+    return fwd_time, bwd_time, total_time
+    # with open("execution_times.txt", "a") as log_file:
+    #     log_file.write(f"bsz: {batch_size},num_head_k: {num_head},num_head_q: {num_head * 4},hsz: {head_size},seqlen: {total_q}, flashattnv1: {flashattnv1_time:.6f}s, "
+    #                     f"flashattnv2: {flashattnv2_time:.6f}s\n")
+    # for x,y in [(out1,out),(dq1,query.grad),(dk1,key.grad),(dv1,value.grad)]:
+    #     strict_check(x.flatten(), y.flatten())
+    # for x,y in [(out1,out)]:
+    #     strict_check(x.flatten(), y.flatten())
     
 def strict_check(x, y):
     if isinstance(x, paddle.Tensor):
@@ -420,11 +411,13 @@ def generate_causal_document_mask(B,S,H,D, doc_seq_lens=[2538, 1742, 3213]):
     doc_seq_lens[-1] += padding
     seq_cusums = np.cumsum(doc_seq_lens)
 
-    startend_row_indices = np.repeat(seq_cusums, doc_seq_lens)
-    startend_row_indices = paddle.to_tensor(startend_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1))
+    lts = np.repeat(seq_cusums, doc_seq_lens)
+    lts = paddle.to_tensor(lts, dtype=paddle.int32).reshape((1, 1, S, 1))
+    ute = paddle.arange(S, dtype='int32').reshape((1, 1, S, 1))
+    startend_row_indices = paddle.concat([lts, ute], axis=-1)
     startend_row_indices = startend_row_indices.repeat_interleave(B, 0)
     
-    causal = True
+    causal = False
     return startend_row_indices, causal
 
 def generate_upper_document_mask(B,S,H,D, doc_seq_lens=[2538, 1742, 3213],padding_size = 256):
@@ -702,8 +695,10 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
             
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
-        for D in [64, 128]:
+        # for D in [64, 128]:
+        for D in [128]:
             H = 4096 // D
+            # H = 1
             # print(doc_seq_lens_list)
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 1
@@ -727,10 +722,10 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                     # "Full": lambda: test_cp_famask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=S, H=H, D=D, dtype=dtype),
                     # "Causal": lambda: test_cp_famask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=S, H=H, D=D, dtype=dtype),
                     # "Sliding Window": lambda: test_cp_famask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=S, H=H, D=D, dtype=dtype),
-                    # "Causal Document Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    # "Document Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    "Causal Document Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    "Document Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
                     # "Share Question Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Global Sliding Window": lambda: test_cp_famask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Global Sliding Window": lambda: test_cp_famask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, D=D, dtype=dtype),
                     # "Causal Blockwise Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
                     "Prefix LM Document Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
                     # "Prefix LM Causal Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=S, H=H, D=D, dtype=dtype),
@@ -750,8 +745,8 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 for ex in ex_to_run:
                     if ex in available_examples:
                         print(ex)
-                        fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = available_examples[ex]()
-                        results.append([ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}"])
+                        fw_time, bw_time, total_time = available_examples[ex]()
+                        results.append([ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}"])
                     else:
                         print(f"Warning: Unknown example key '{ex}'. Skipping.")
 
@@ -761,13 +756,6 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                     "FW Time (ms)",
                     "BW Time (ms)",
                     "TOTAL Time (ms)",
-                    "FW FLOPs",
-                    "BW FLOPs",
-                    "TOTAL FLOPs",
-                    "FW TFLOPs/s",
-                    "BW TFLOPs/s",
-                    "TOTAL TFLOPs/s",
-                    "Sparsity",
                 ]
                 print(
                     tabulate(
@@ -778,8 +766,9 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 )
                 
                 content2=tabulate(results, headers=headers, tablefmt="tsv")
-                os.makedirs(f"{dtype}_dist_test", exist_ok=True)
-                text_file = open(f"{dtype}_dist_test/flashmask_{rank}_{cp_size}_{B}_{S}_{H}_{D}_{idx}.csv","w")
+                os.makedirs(f"{dtype}", exist_ok=True)
+                # text_file = open(f"{dtype}_dist_test/flashmask_{rank}_{B}_{S}_{H}_{D}_{idx}.csv","w")
+                text_file = open(f"{dtype}_dist_test/flashmask_{B}_{S}_{H}_{D}_{idx}_{rank}.csv","w")
                 text_file.write(content2)
                 text_file.close()
                 # assert False

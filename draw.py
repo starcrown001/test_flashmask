@@ -126,11 +126,11 @@ def main(baseline: str = "flashmaskv1"):
             for headdim in [128]:
                 categories = {}
                 # for seqlen in [32768,131072]:
-                for seqlen in [8192,16384,32768,65536,131072]:
+                for seqlen in [8192,32768,131072]:
                 # for seqlen in [8192]:
                     method_to_df = {}
                     for method in [baseline, 'flashmaskv3']:
-                        filenames = glob.glob(f'{root_dir}/{dtype}gsw/{method}_*{seqlen}_*_{headdim}*.csv')
+                        filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}*.csv')
                         print(filenames)
                         dataframes = []
                         non_numeric_column = 'Operation'

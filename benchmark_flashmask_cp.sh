@@ -23,8 +23,8 @@ for name in `env | grep -E 'PADDLE|ENDPOINT' | awk -F'=' '{print $1}'`; do
   unset ${name}
 done
 
-START_RANK=0
-END_RANK=2
+START_RANK=2
+END_RANK=3
 
 if [[ $rank -lt $START_RANK ]]; then
     exit 0
@@ -39,8 +39,9 @@ master=`cat /root/paddlejob/workspace/hostfile | head -n $(($START_RANK+1)) | ta
 port=36677
 
 export FLAGS_flash_attn_version=3
+export CP_SIZE=8
 
-/root/paddlejob/workspace/env_run/xiehaoyang/fm_env/bin/python -m paddle.distributed.launch \
+/root/paddlejob/workspace/env_run/xiehaoyang/fm_cp_env/bin/python -m paddle.distributed.launch \
     --log_dir paddle_cp_logs/output/paddle_distributed_logs \
     --master $master:$port \
     --nnodes $nnodes \

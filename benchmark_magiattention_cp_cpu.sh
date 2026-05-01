@@ -15,15 +15,15 @@
 # limitations under the License.
 
 # ------------------------------------------------------------------ #
-#  MagiAttention-only distributed benchmark                           #
+#  MagiAttention-only distributed benchmark (CPU Timing)               #
 #  Single-node, 8-GPU                                                  #
 # ------------------------------------------------------------------ #
 
 # ---- 分布式基础配置 ---- #
 export MASTER_ADDR=${MASTER_ADDR:-10.52.98.148}
 export MASTER_PORT=${MASTER_PORT:-16988}
-export NNODES=1
-export NPROC_PER_NODE=4
+export NNODES=4
+export NPROC_PER_NODE=8
 export RANK=0
 export WORLD_SIZE=$((NPROC_PER_NODE * NNODES))
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
@@ -38,12 +38,12 @@ export TORCH_NCCL_HIGH_PRIORITY=1
 export MAGI_ATTENTION_CATGQA=0
 export MAGI_ATTENTION_AUTO_RANGE_MERGE=0
 export MAGI_ATTENTION_BWD_HIDE_TAIL_REDUCE=0
-export MAGI_ATTENTION_HIERARCHICAL_COMM=1   # 单机不需要分层通信
+export MAGI_ATTENTION_HIERARCHICAL_COMM=0   # 单机不需要分层通信
 export MAGI_ATTENTION_NATIVE_GRPCOLL=0
 export MAGI_ATTENTION_QO_COMM=0
 export MAGI_ATTENTION_FLATTEN_HEAD_GROUPS=0
 export MAGI_ATTENTION_FA4_BACKEND=0         # Hopper 上不使用 FA4
-
+# export PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync
 # ---- Python 环境 ---- #
 source /root/paddlejob/workspace/env_run/xiehaoyang/magiattn_env/bin/activate
 PYTHON=/root/paddlejob/workspace/env_run/xiehaoyang/magiattn_env/bin/python
@@ -77,7 +77,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "============================================================"
-echo "  MagiAttention Distributed Benchmark"
+echo "  MagiAttention Distributed Benchmark (CPU Timing)"
 echo "  MASTER_ADDR=$MASTER_ADDR  MASTER_PORT=$MASTER_PORT"
 echo "  NNODES=$NNODES  NPROC_PER_NODE=$NPROC_PER_NODE"
 echo "  WORLD_SIZE=$WORLD_SIZE"
@@ -92,4 +92,4 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT
 "
 
-torchrun $DISTRIBUTED_ARGS benchmark_magiattention_cp.py --config "$CONFIG_PATH" --fast_eval false
+torchrun $DISTRIBUTED_ARGS benchmark_magiattention_cp_cpu.py --config "$CONFIG_PATH" --fast_eval true

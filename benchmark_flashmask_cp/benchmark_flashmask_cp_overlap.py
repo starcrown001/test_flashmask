@@ -6,24 +6,87 @@ import paddle
 import os
 import paddle.nn.functional as F
 from paddle.nn.functional.flash_attention import flashmask_attention
-from context_parallel_utils import flashmask_attention_cp
+from context_parallel_utils_new import scatter_balance, all_gather_balance
+from flash_mask.cp_balance import balance_flashmask_input, get_q_workload, assign_tasks_heap
+from overlap_utils import overlap_flashmask_attention
 from sparsity_utils import flashmask_block_sparsity
 
+from jsonargparse import ArgumentParser
 import paddle.distributed.fleet as fleet
 import time
 
 import numpy as np
 
-cp_size = int(os.environ.get("CP_SIZE", 16))
+def get_args():
+    parser = ArgumentParser(description="Run specific examples or all examples.")
+    parser.add_argument(
+        "--examples",
+        type=str,
+        nargs="+",
+        default=["all"],
+        help="List of examples to run. Use space to separate multiple examples. "
+        "Available options: causal, alibi, sliding_window, prefix_lm, "
+        "document, softcap, softcap_approx, or 'all' to run all examples.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bf16"
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true"
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=1
+    )
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=1
+    )
+    parser.add_argument(
+        "--use_rs",
+        action="store_true"
+    )
+
+    return parser.parse_args()
+
+args = get_args()
+output_prefix = "flashmask_overlap"
+if args.batch == 0:
+    input_file = 'kernel_test_dist_seq_info.txt'
+    cp_size = (int)(os.getenv("CP_SIZE", "8"))
+    mp_size = 1
+    sd_size = cp_size
+else:
+    input_file = 'kernel_test_dist_seq_info.txt'
+    cp_size = 8
+    mp_size = 2
+    sd_size = 8
+
+if cp_size == 32:
+    input_file = 'kernel_test_dist_seq_info_cp32.txt'
+
+if args.profile:
+    BENCH_TIME = 20
+    WARM_UP = 5
+else:
+    BENCH_TIME = 1500
+    WARM_UP = 100
+
+cp_use_ipo = False
 strategy = fleet.DistributedStrategy()
 
 strategy.hybrid_configs = {
   "dp_degree": 1,
-  "mp_degree": 1,
+  "mp_degree": mp_size,
   "pp_degree": 1,
-  "sharding_degree": cp_size,
+  "sharding_degree": sd_size,
   "sep_degree": 1,
-  "ep_degree":  cp_size,
+  "ep_degree":  cp_size * mp_size,
   "moe_sharding_degree": 1,
   "cp_degree": cp_size,
   "order": ["sharding", "moe_sharding", "pp", "sep", "cp", "dp", "ep", "mp"]
@@ -43,14 +106,6 @@ class bcolors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
     
-def from_paddle(x: paddle.Tensor):
-    if x.dtype == paddle.bfloat16 or x.dtype == "bfloat16":
-      return torch.from_numpy(x.view("uint16").numpy()).to("cuda").view(torch.bfloat16)
-    elif x.dtype == paddle.float32 or x.dtype == "float32":
-      return torch.from_numpy(x.numpy()).to("cuda")
-    else:
-      assert False
-      
 def _summarize_statistics(times, quantiles, return_mode):
     if quantiles is not None:
         ret = paddle.quantile(times, paddle.to_tensor(quantiles, dtype=paddle.float32)).tolist()
@@ -72,9 +127,44 @@ def split_sequence(sequence_length, num_answers=2):
 
     return lengths
 
-def do_bench_flashmaskcp(q_local, k_local, v_local, o_grad_local, startend_row_indices, group, is_causal, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
+def do_bench_dist(fn, cp_group, warmup=1, rep=300, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
     """
-    Benchmark the runtime of the provided function using CUDA event-based timing.
+    Benchmark the runtime of the provided function for distributed operations (balance/scatter/gather).
+    """
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+    paddle.base.core.nvprof_nvtx_push("paddle")
+
+    fn()
+    paddle.device.synchronize()
+    paddle.distributed.barrier(group=cp_group)
+
+    n_warmup = 3
+    n_repeat = 5
+    # Warm-up
+    for _ in range(n_warmup):
+        fn()
+        paddle.device.synchronize()
+        paddle.distributed.barrier(group=cp_group)
+    # Benchmark
+    dist_time = []
+    for i in range(n_repeat):
+        paddle.device.synchronize()
+        paddle.distributed.barrier(group=cp_group)
+        time0 = time.perf_counter()
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        fn()
+        paddle.device.synchronize()
+        paddle.distributed.barrier(group=cp_group)
+        time1 = time.perf_counter()
+        dist_time.append((time1 - time0) * 1000)
+    paddle.base.core.nvprof_nvtx_pop()
+    return sum(dist_time) / n_repeat
+
+def do_bench_flashmaskcp(q_local, k_local, v_local, o_grad_local, startend_row_indices, group, is_causal, mode="balance", warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
+    """
+    Benchmark the runtime of overlap_flashmask_attention using CUDA event-based timing.
 
     :param warmup: Number of warmup iterations
     :type warmup: int
@@ -91,8 +181,11 @@ def do_bench_flashmaskcp(q_local, k_local, v_local, o_grad_local, startend_row_i
     """
     assert return_mode in ["min", "max", "mean", "median"]
 
+    rank = paddle.distributed.get_rank()
+    print(f"overlap debug {q_local.shape=}, {k_local.shape=}, {v_local.shape=}, {startend_row_indices.shape=}")
+
     # Initial run to ensure correctness and warm up CUDA context
-    out_local = flashmask_attention_cp(q_local, k_local, v_local, startend_row_indices, causal=is_causal)
+    out_local = overlap_flashmask_attention(q_local, k_local, v_local, startend_row_indices, causal=is_causal, mode=mode, use_rs=args.use_rs)
     out_local.backward(o_grad_local)
     paddle.distributed.barrier(group=cp_group)
     paddle.device.synchronize()
@@ -116,7 +209,7 @@ def do_bench_flashmaskcp(q_local, k_local, v_local, o_grad_local, startend_row_i
 
     # Warm-up
     for _ in range(n_warmup):
-        out_local = flashmask_attention_cp(q_local, k_local, v_local, startend_row_indices, causal=is_causal)
+        out_local = overlap_flashmask_attention(q_local, k_local, v_local, startend_row_indices, causal=is_causal, mode=mode, use_rs=args.use_rs)
         out_local.backward(o_grad_local)
     paddle.distributed.barrier(group=cp_group)
     paddle.device.synchronize()
@@ -137,7 +230,7 @@ def do_bench_flashmaskcp(q_local, k_local, v_local, o_grad_local, startend_row_i
 
         # Forward timing
         fwd_start_event[i].record()
-        out_local = flashmask_attention_cp(q_local, k_local, v_local, startend_row_indices, causal=is_causal)
+        out_local = overlap_flashmask_attention(q_local, k_local, v_local, startend_row_indices, causal=is_causal, mode=mode, use_rs=args.use_rs)
         fwd_end_event[i].record()
 
         # Backward timing
@@ -187,29 +280,56 @@ def cal_flops(B, H, Sq, Sk, D, mode='fwd'):
 def cal_tflops(flops, time_ms):
     return  flops * (1e3 / time_ms) / 1e12
 
-def cp_flashmask_balance_bench(q, k, v, startend_row_indices, is_causal,o_grad):
+def cp_flashmask_balance_bench(query, key, value, startend_row_indices, is_causal, o_grad, mode):
+    B, S, H, D = query.shape
     group = cp_group
-    rank = paddle.distributed.get_rank()
-    q_blocksize = (int)(q.shape[1] // (2 * cp_size))
-    k_blocksize = (int)(k.shape[1] // cp_size)
-    q_local_1 = q[:, rank*q_blocksize:(rank+1)*q_blocksize, :, :]
-    q_local_2 = q[:, (cp_size *2 -rank -1)*q_blocksize:(cp_size *2 -rank)*q_blocksize, :, :]
-    q_local = paddle.concat([q_local_1, q_local_2], axis=1).detach()
-    k_local = k[:, rank*k_blocksize:(rank+1)*k_blocksize, :, :].detach().contiguous()
-    v_local = v[:, rank*k_blocksize:(rank+1)*k_blocksize, :, :].detach().contiguous()
-    o_grad_local_1 = o_grad[:, rank * q_blocksize : (rank + 1) * q_blocksize, :, :].detach()
-    o_grad_local_2 = o_grad[:, (cp_size * 2 - rank - 1) * q_blocksize : (cp_size * 2 - rank) * q_blocksize, :, :].detach()
-    o_grad_local = paddle.concat([o_grad_local_1, o_grad_local_2], axis=1).contiguous()
+    rank = group.rank
+    local_qs = []
+    local_ks = []
+    local_vs = []
+    local_ograds = []
+    balance_q_chunksize = 2048
+    workload = get_q_workload(startend_row_indices, balance_q_chunksize, 128, 128)
 
-    
-    q_local.stop_gradient = False
-    k_local.stop_gradient = False
-    v_local.stop_gradient = False
-    # startend_row_indices.stop_gradient = False
+    total_workload = paddle.sum(workload, axis=1)
+    if cp_use_ipo:
+        buckets, bucket_weights, cuts = assign_tasks_ipo(workload.reshape(-1, 2), cp_size)
+    else:
+        buckets, bucket_weights, cuts = assign_tasks_heap(workload.reshape(-1, 2), cp_size)
+    hcg = fleet.get_hybrid_communicate_group()
+    # print(buckets)
+    for (_, idx) in buckets[rank]:
+        local_qs.append(query[:, idx * balance_q_chunksize:(idx + 1) * balance_q_chunksize, :, :])
+        local_ks.append(key[:, idx * balance_q_chunksize:(idx + 1) * balance_q_chunksize, :, :])
+        local_vs.append(value[:, idx * balance_q_chunksize:(idx + 1) * balance_q_chunksize, :, :])
+        local_ograds.append(o_grad[:, idx * balance_q_chunksize:(idx + 1) * balance_q_chunksize, :, :])
+    local_q = paddle.concat(local_qs, axis=1).detach().contiguous()
+    local_k = paddle.concat(local_ks, axis=1).detach().contiguous()
+    local_v = paddle.concat(local_vs, axis=1).detach().contiguous()
+    local_o_grad = paddle.concat(local_ograds, axis=1)
+    local_startend_row_indices, buckets = balance_flashmask_input(startend_row_indices, cp_size, rank)
+    local_q = scatter_balance(query, group=cp_group, axis=1, mode="balanced_swap", buckets=buckets).detach().contiguous()
+    print("pass0")
+    balancex = lambda: balance_flashmask_input(startend_row_indices, cp_size, rank)
+    balance_time = do_bench_dist(balancex, cp_group=cp_group)
+    print("pass1")
 
-    cp_fwd_time, cp_bwd_time = do_bench_flashmaskcp(q_local, k_local, v_local, o_grad_local, startend_row_indices, group, is_causal)
-    # print(f"cp balance fwd+bwd time: {cp_fwd_bwd_time} ms\n")
-    return cp_fwd_time, cp_bwd_time
+    local_k.stop_gradient = False
+    local_v.stop_gradient = False
+    local_q.stop_gradient = False
+    x = query.detach().reshape(B, S, -1).contiguous()
+
+    local_startend_row_indices, buckets = balance_flashmask_input(startend_row_indices, cp_size, rank, balance_chunk_size=balance_q_chunksize)
+
+    scatter_x = lambda: scatter_balance(x, group=cp_group, axis=1, mode="balanced_swap", buckets=buckets)
+    scatter_x_time = do_bench_dist(scatter_x, cp_group=cp_group)
+    local_x = scatter_balance(x, group=cp_group, axis=1, mode="balanced_swap", buckets=buckets)
+
+    gather_x = lambda: all_gather_balance(local_x, group=cp_group, axis=1, mode="balanced_swap", buckets=buckets)
+    gather_x_time = do_bench_dist(gather_x, cp_group=cp_group)
+
+    cp_fwd_time, cp_bwd_time = do_bench_flashmaskcp(local_q, local_k, local_v, local_o_grad, local_startend_row_indices, group, is_causal, mode)
+    return balance_time, scatter_x_time, gather_x_time, cp_fwd_time, cp_bwd_time
 
 def test_cp_famask(
     generate_mask_fn,
@@ -220,10 +340,10 @@ def test_cp_famask(
     dtype = 'bf16',
 ):
     """
-    测试上下文并行FlashMask注意力机制的性能基准
+    测试上下文并行FlashMask注意力机制的性能基准 (overlap版本)
     
-    该函数用于测试在分布式并行环境中FlashMask注意力机制的前向传播和后向传播性能，
-    支持不同类型的注意力掩码生成策略。
+    该函数用于测试在分布式并行环境中使用overlap策略的FlashMask注意力机制的
+    前向传播和后向传播性能，支持不同类型的注意力掩码生成策略。
 
     Args:
         generate_mask_fn: 注意力掩码生成函数，用于生成startend_row_indices和因果关系标记
@@ -234,35 +354,48 @@ def test_cp_famask(
         dtype: 数据类型，默认'bf16'
 
     Returns:
-        tuple: 包含前向传播时间和后向传播时间的元组 (fwd_time, bwd_time)，单位为毫秒
+        tuple: 包含前向传播时间、后向传播时间、FLOPS、TFLOPS、稀疏度以及balance/scatter/gather开销
     """
-    # paddle.seed(2024)
     paddle.seed(2024)
-    # batch_size = 1
     total_q = S
     total_k = S
     batch_size = B
     num_head = H
+    num_head_q = 8 * H
     head_size = D
-    # total_k = total_q * 2
-    query = paddle.randn([batch_size, total_q, num_head, head_size], dtype=paddle.bfloat16) 
-    key = paddle.randn([batch_size, total_k, num_head, head_size], dtype=paddle.bfloat16)
-    value = paddle.randn([batch_size, total_k, num_head, head_size], dtype=paddle.bfloat16)
-    o_grad = paddle.randn([batch_size, total_q, num_head, head_size], dtype=paddle.bfloat16)
-    query.stop_gradient = False
-    key.stop_gradient = False
-    value.stop_gradient = False
+    rank = cp_group.rank
 
     startend_row_indices, causal = None, True
     if generate_mask_fn is not None:
-        print("enter",generate_mask_fn)
+        print("enter", generate_mask_fn)
         startend_row_indices, causal = generate_mask_fn(batch_size, total_q, num_head, head_size)
-        # startend_row_indices, causal = generate_mask_fn(total_q)
-        
-    # print(startend_row_indices)
-    # paddle.set_printoptions(precision=None, threshold=10000000, edgeitems=None, sci_mode=None, linewidth=None)
 
-    fwd_time, bwd_time = cp_flashmask_balance_bench(query, key, value, startend_row_indices, causal,o_grad)
+    if rank == 0:
+        query = paddle.randn([batch_size, total_q, num_head_q, head_size], dtype=paddle.bfloat16)
+        key = paddle.randn([batch_size, total_k, num_head, head_size], dtype=paddle.bfloat16)
+        value = paddle.randn([batch_size, total_k, num_head, head_size], dtype=paddle.bfloat16)
+        o_grad = paddle.randn([batch_size, total_q, num_head_q, head_size], dtype=paddle.bfloat16)
+    else:
+        query = paddle.empty([batch_size, total_q, num_head_q, head_size], dtype=paddle.bfloat16)
+        key = paddle.empty([batch_size, total_k, num_head, head_size], dtype=paddle.bfloat16)
+        value = paddle.empty([batch_size, total_k, num_head, head_size], dtype=paddle.bfloat16)
+        o_grad = paddle.empty([batch_size, total_q, num_head_q, head_size], dtype=paddle.bfloat16)
+
+    print(f"wsm debug {query.shape=}, {key.shape=}, {value.shape=}, {startend_row_indices.shape=}")
+
+    # 广播到所有 rank
+    paddle.distributed.broadcast(query, src=cp_group.ranks[0], group=cp_group)
+    paddle.distributed.broadcast(key, src=cp_group.ranks[0], group=cp_group)
+    paddle.distributed.broadcast(value, src=cp_group.ranks[0], group=cp_group)
+    paddle.distributed.broadcast(o_grad, src=cp_group.ranks[0], group=cp_group)
+    paddle.device.synchronize()
+    paddle.distributed.barrier(group=cp_group)
+    query.stop_gradient = False
+    key.stop_gradient = False
+    value.stop_gradient = False
+    causal = False
+
+    balance_time, scatter_x_time, gather_x_time, fwd_time, bwd_time = cp_flashmask_balance_bench(query, key, value, startend_row_indices, causal, o_grad, "balance_q")
     paddle.device.synchronize()
 
     total_time = fwd_time + bwd_time
@@ -270,124 +403,22 @@ def test_cp_famask(
     sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, S)
     density = 1.0 - sparsity
 
-    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd') / cp_size
-    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd') / cp_size
-    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd') / cp_size
+    fwd_flops = density * cal_flops(B, num_head_q, S, S, D, mode='fwd') / cp_size
+    bwd_flops = density * cal_flops(B, num_head_q, S, S, D, mode='bwd') / cp_size
+    total_flops = density * cal_flops(B, num_head_q, S, S, D, mode='fwd_bwd') / cp_size
 
     fwd_tflops = cal_tflops(fwd_flops, fwd_time)
     bwd_tflops = cal_tflops(bwd_flops, bwd_time)
     total_tflops = cal_tflops(total_flops, total_time)
 
-    return fwd_time, bwd_time, total_time, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity
-    
-def strict_check(x, y):
-    if isinstance(x, paddle.Tensor):
-        if x.dtype == paddle.bfloat16 or x.dtype == "float16":
-          # x = x.view("float16").numpy()
-          x = x.cast("float32").numpy()
-        else:
-          x = x.numpy()
-    else:
-      assert False
-
-    # if isinstance(y, torch.Tensor):
-    #     if y.dtype == torch.bfloat16 or y.dtype == "bfloat16":
-    #       # x = x.view("float16").numpy()
-    #       y = y.to(torch.float32).detach().cpu().numpy()
-    #     else:
-    #       y = y.detach().cpu().numpy()
-
-    if isinstance(y, paddle.Tensor):
-        if y.dtype == paddle.bfloat16 or y.dtype == "float16":
-          # y = y.view("float16").numpy()
-          y = y.cast("float32").numpy()
-        else:
-          y = y.numpy()
-
-    try:
-        print(f"{x=}, {y=}")
-        np.testing.assert_allclose(x.flatten(), y.flatten(),rtol=1e-2, atol=1e-2)
-    except Exception as e:
-        print('---------------')
-        idx = np.where(~(x == y))
-        print(f"fail idx: {idx=}")
-        print(f"shape:'{x.shape}'")
-        # print(f"fail idx:'{np.unique(idx[0])}'")
-        print(x[idx])
-        print(y[idx])
-        raise e
-    
-
-def ele_check(x, y):
-    if isinstance(x, paddle.Tensor):
-        if x.dtype == paddle.bfloat16 or x.dtype == "bfloat16":
-          # x = x.view("uint16").numpy()
-          x = x.cast("float32").numpy()
-        else:
-          x = x.numpy()
-    else:
-      assert False
-
-    if isinstance(y, torch.Tensor):
-        if y.dtype == torch.bfloat16 or y.dtype == "bfloat16":
-          # x = x.view("uint16").numpy()
-          y = y.to(torch.float32).detach().cpu().numpy()
-        else:
-          y = y.detach().cpu().numpy()
-
-    # if isinstance(y, paddle.Tensor):
-    #     if y.dtype == paddle.bfloat16 or y.dtype == "bfloat16":
-    #       # y = y.view("uint16").numpy()
-    #       y = y.cast("float32").numpy()
-    #     else:
-    #       y = y.numpy()
-
-    try:
-        print(f"{x=}, {y=}")
-        np.testing.assert_allclose(np.sort(x.flatten()), np.sort(y.flatten()),rtol=1e-3, atol=1e-6)
-    except Exception as e:
-        print('---------------')
-        idx = np.where(~(x == y))
-        print(f"fail idx: {idx=}")
-        print(f"shape:'{x.shape}'")
-        # print(f"fail idx:'{np.unique(idx[0])}'")
-        print(x[idx])
-        print(y[idx])
-        raise e
-
-def flashmask_to_densemask(startend_row_indices, dtype, causal=True):
-    if startend_row_indices is None:
-        return None
-    bz, num_head, seq_len, bound_num = startend_row_indices.shape
-    m = paddle.zeros((bz, num_head, seq_len, seq_len), dtype=dtype)
-    has_end = (causal and bound_num == 2) or ((not causal) and bound_num == 4)
-    for bi in range(bz):
-        for hi in range(num_head):
-            for j in range(seq_len):
-                downstart = startend_row_indices[bi, hi, j, 0]
-                if has_end:
-                    downend = startend_row_indices[bi, hi, j, 1]
-                    m[bi, hi, downstart:downend, j] = -np.inf
-                else:
-                    m[bi, hi, downstart:, j] = -np.inf
-                if causal:
-                    m[bi, hi, :j, j] = -np.inf
-                else:
-                    if has_end:
-                        upstart = startend_row_indices[bi, hi, j, 2]
-                        upend = startend_row_indices[bi, hi, j, 3]
-                        m[bi, hi, upstart:upend, j] = -np.inf
-                    else:
-                        upend = startend_row_indices[bi, hi, j, 1]
-                        m[bi, hi, :upend, j] = -np.inf
-    return m
+    return fwd_time, bwd_time, total_time, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity, balance_time, scatter_x_time, gather_x_time
 
 def generate_none_mask(B, S, H, D, causal=True):
     return None, causal
 
 def generate_ones_mask(B, S, H, D):
     startend_row_indices = paddle.zeros(
-        shape=(B, H, S, 2), dtype="int32"
+        shape=(B, 1, S, 2), dtype="int32"
     )
     startend_row_indices[:,:,:,0]=S
     causal = False
@@ -395,7 +426,7 @@ def generate_ones_mask(B, S, H, D):
 
 def generate_causal_mask(B,S,H,D):
     startend_row_indices = paddle.zeros(
-        shape=(B, H, S, 1), dtype="int32"
+        shape=(B, 1, S, 1), dtype="int32"
     )
     startend_row_indices[:,:,:,0]=S
     causal = True
@@ -412,7 +443,6 @@ def generate_sliding_window_mask(B, S, H, D, window_size=1024):
     causal=True
     return startend_row_indices, causal
 
-# def generate_causal_document_mask(B, S, H, D, doc_seq_lens=[2538, 1742, 3213]):
 def generate_causal_document_mask(B,S,H,D, doc_seq_lens=[2538, 1742, 3213]):
     total_seq_len = np.sum(doc_seq_lens)
     assert total_seq_len <= S, f"{total_seq_len=}, {S=}"
@@ -420,11 +450,13 @@ def generate_causal_document_mask(B,S,H,D, doc_seq_lens=[2538, 1742, 3213]):
     doc_seq_lens[-1] += padding
     seq_cusums = np.cumsum(doc_seq_lens)
 
-    startend_row_indices = np.repeat(seq_cusums, doc_seq_lens)
-    startend_row_indices = paddle.to_tensor(startend_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1))
+    lts = np.repeat(seq_cusums, doc_seq_lens)
+    lts = paddle.to_tensor(lts, dtype=paddle.int32).reshape((1, 1, S, 1))
+    ute = paddle.arange(S, dtype='int32').reshape((1, 1, S, 1))
+    startend_row_indices = paddle.concat([lts, ute], axis=-1)
     startend_row_indices = startend_row_indices.repeat_interleave(B, 0)
     
-    causal = True
+    causal = False
     return startend_row_indices, causal
 
 def generate_upper_document_mask(B,S,H,D, doc_seq_lens=[2538, 1742, 3213],padding_size = 256):
@@ -633,35 +665,6 @@ def generate_qk_sparse_mask(B, S, H, D, maskout_pair=[(1024, 538), (2358, 1700)]
     causal = True
     return startend_row_indices, causal
 
-#def generate_hash_sparse_mask(B, S, H, D, maskout_pair=[(1024, 538), (2358, 1700)]):
-#    """
-#    tuple(offset, maskout_len)
-#    """
-#    start_row_indices = []
-#    end_row_indices  = []
-#    last_offset = 0
-#    for offset, maskout_len in maskout_pair:
-#        assert offset > last_offset
-#        start_row_indices.append([S]*(offset-last_offset))
-#        end_row_indices.append([S]*(offset-last_offset))
-#
-#        start_row_indices.append(list(range(offset, offset+maskout_len)))
-#        end_row_indices.append([offset+maskout_len]*(maskout_len))
-#
-#        last_offset = offset + maskout_len
-#
-#    last_offset <= S
-#    start_row_indices.append([S]*(S-last_offset))
-#    end_row_indices.append([S]*(S-last_offset))
-#
-#    start_row_indices = paddle.to_tensor(start_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-#    end_row_indices = paddle.to_tensor(end_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-#    startend_row_indices = paddle.concat([down_left_row_indices, up_right_row_indices], axis=-1)
-#
-#    causal = False
-#    return startend_row_indices, causal
-
-
 def generate_random_eviction_mask(B, S, H, D, start_row=4096):
     np.random.seed(0)
     start_rows_list = []
@@ -679,7 +682,7 @@ def generate_random_eviction_mask(B, S, H, D, start_row=4096):
     causal = True
     return startend_row_indices, causal
 
-def main(examples: List[str] = ["all"], dtype='bf16'):
+def main(examples: List[str] = ["all"], dtype='bf16', profile=False, batch=1, num_heads=8, use_rs=False):
     """Run the benchmark with the given examples.
 
     Args:
@@ -689,7 +692,7 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
     paddle.set_flags({'FLAGS_flash_attn_version': 3})
     doc_seq_lens_list = []
     rank = paddle.distributed.get_rank()
-    with open('kernel_test_dist_seq_info.txt', 'r') as f:
+    with open(input_file, 'r') as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -701,11 +704,12 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 qksparse_mask = eval(line.split(":")[-1].split("#")[1].strip())
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
             
-        #doc_seq_lens_list = doc_seq_lens_list[::-1]
-        for D in [64, 128]:
-            H = 4096 // D
-            # print(doc_seq_lens_list)
+        for D in [ 128]:
+            H = 4
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
+                if(S // cp_size < 4096):
+                    print(f"Skipped {S}")
+                    continue
                 B = 1
 
                 doc_seq_lens = [x[1] for x in prefix_doc_seq_lens]
@@ -724,13 +728,13 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 print(share_qa_docs)
 
                 available_examples = {
-                    # "Full": lambda: test_cp_famask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=S, H=H, D=D, dtype=dtype),
-                    # "Causal": lambda: test_cp_famask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Full": lambda: test_cp_famask(generate_mask_fn=partial(generate_ones_mask), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Causal": lambda: test_cp_famask(generate_mask_fn=partial(generate_causal_mask), B=B, S=S, H=H, D=D, dtype=dtype),
                     # "Sliding Window": lambda: test_cp_famask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=S, H=H, D=D, dtype=dtype),
-                    # "Causal Document Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    # "Document Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    "Causal Document Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
+                    "Document Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
                     # "Share Question Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Global Sliding Window": lambda: test_cp_famask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, D=D, dtype=dtype),
+                    # "Global Sliding Window": lambda: test_cp_famask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, D=D, dtype=dtype),
                     # "Causal Blockwise Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
                     "Prefix LM Document Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
                     # "Prefix LM Causal Mask": lambda: test_cp_famask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=S, H=H, D=D, dtype=dtype),
@@ -750,8 +754,8 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 for ex in ex_to_run:
                     if ex in available_examples:
                         print(ex)
-                        fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = available_examples[ex]()
-                        results.append([ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}"])
+                        fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity, balance_time, scatter_x_time, gather_x_time = available_examples[ex]()
+                        results.append([ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}", f"{balance_time:.4f}", f"{scatter_x_time:.4f}", f"{gather_x_time:.4f}"])
                     else:
                         print(f"Warning: Unknown example key '{ex}'. Skipping.")
 
@@ -768,6 +772,9 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                     "BW TFLOPs/s",
                     "TOTAL TFLOPs/s",
                     "Sparsity",
+                    "Balance Time (ms)",
+                    "Scatter Time (ms)",
+                    "Gather Time (ms)",
                 ]
                 print(
                     tabulate(
@@ -779,31 +786,10 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 
                 content2=tabulate(results, headers=headers, tablefmt="tsv")
                 os.makedirs(f"{dtype}_dist_test", exist_ok=True)
-                text_file = open(f"{dtype}_dist_test/flashmask_{rank}_{cp_size}_{B}_{S}_{H}_{D}_{idx}.csv","w")
+                text_file = open(f"{dtype}_dist_test/{output_prefix}_{rank}_{cp_size}_{B}_{S}_{H}_{D}_{idx}.csv","w")
                 text_file.write(content2)
                 text_file.close()
-                # assert False
 
 if __name__ == "__main__":
-    try:
-        from jsonargparse import ArgumentParser
-    except ImportError:
-        raise ImportError("Be sure to run: pip install -e .'[viz]'")
-    parser = ArgumentParser(description="Run specific examples or all examples.")
-    parser.add_argument(
-        "--examples",
-        type=str,
-        nargs="+",
-        default=["all"],
-        help="List of examples to run. Use space to separate multiple examples. "
-        "Available options: causal, alibi, sliding_window, prefix_lm, "
-        "document, softcap, softcap_approx, or 'all' to run all examples.",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="bf16"
-    )
-
-    args = parser.parse_args()
+    print("New FlashMask Balance + Overlap!")
     main(**vars(args))

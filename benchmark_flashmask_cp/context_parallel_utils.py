@@ -15,7 +15,198 @@ from paddle import distributed as dist
 from paddle.distributed import fleet
 from paddle.nn.functional.flash_attention import flashmask_attention
 from paddle.autograd.py_layer import PyLayer
-import numpy as np
+import inspect
+
+try:
+    from flash_mask.cute.flashmask_utils import FlashMaskInfoPaddle
+    from flash_mask.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+except (ImportError, ModuleNotFoundError):
+    FlashMaskInfoPaddle = None
+    _flash_attn_fwd = None
+    _flash_attn_bwd = None
+
+
+class AudioEmbeddingContextParallelFunction(paddle.autograd.PyLayer):
+    """CP计算audio embedding, 减少单卡显存"""
+
+    @staticmethod
+    def forward(
+        ctx,
+        input_ids,
+        embedding_weights,
+        prefix_num=None,
+        padding_idx=-1,
+        group=None,
+        mm_embeds_checkpoint_parallel=False,
+    ):
+        """forward"""
+        if group is None:
+            group = fleet.get_hybrid_communicate_group().get_context_parallel_group()
+
+        assert input_ids.stop_gradient, "input_ids must be stop_gradient"
+        if prefix_num is not None:
+            input_ids = input_ids[:prefix_num]
+            if prefix_num == 1 and paddle.any(input_ids == -1).item():
+                # Fake数据中存在-1，则将input_ids置为0
+                input_ids = paddle.zeros_like(input_ids)
+
+        depth = len(embedding_weights)
+        nranks = group.nranks
+        assert depth % nranks == 0, f"embedding_weights depth {depth} must be divisible by nranks {nranks}"
+
+        depth_per_rank = depth // nranks
+        start_idx = group.rank * depth_per_rank
+        depth_list_cur_rank = range(start_idx, start_idx + depth_per_rank)
+
+        input_embeds = []
+        for code_depth in depth_list_cur_rank:
+            input_embeds.append(
+                _C_ops.embedding(
+                    input_ids[..., code_depth],
+                    embedding_weights[code_depth],
+                    padding_idx,
+                    False,  # sparse
+                ).unsqueeze(1)
+            )
+        input_embeds = paddle.concat(input_embeds, axis=1)
+
+        if mm_embeds_checkpoint_parallel:
+            assert (
+                input_embeds.shape[-1] % nranks == 0
+            ), f"input_embeds shape {-1} must be divisible by nranks {nranks} when using mm_embeds_checkpoint_parallel"
+            # [S, Depth // CP, HiddenSize] -> CP * [S, Depth // CP, HiddenSize // CP]
+            input_embeds_list = paddle.split(input_embeds, nranks, axis=-1)
+            input_embeds_global = []
+            paddle.distributed.stream.alltoall(
+                input_embeds_global,
+                input_embeds_list,
+                group=group,
+            )
+            # CP * [S, Depth // CP, HiddenSize // CP] -> [S, Depth, HiddenSize // CP]
+            input_embeds = paddle.concat(input_embeds_global, axis=1)
+        else:
+            input_embeds_global = []
+            paddle.distributed.all_gather(input_embeds_global, input_embeds, group=group)
+            input_embeds = paddle.concat(input_embeds_global, axis=1)
+
+        ctx.save_for_backward(embedding_weights, input_ids)
+        ctx.padding_idx = padding_idx
+        ctx.group = group
+        ctx.depth_list_cur_rank = depth_list_cur_rank
+        ctx.depth_per_rank = depth_per_rank
+        ctx.mm_embeds_checkpoint_parallel = mm_embeds_checkpoint_parallel
+        return input_embeds
+
+    @staticmethod
+    def backward(ctx, output_grad):
+        """backward"""
+        embedding_weights, input_ids = ctx.saved_tensor()
+        nranks = ctx.group.nranks
+
+        if ctx.mm_embeds_checkpoint_parallel:
+            # [S, Depth, HiddenSize // CP] -> CP * [S, Depth // CP, HiddenSize // CP]
+            tmp_output_grad = paddle.split(output_grad, nranks, axis=1)
+            output_grad_golbal = []
+            paddle.distributed.stream.alltoall(
+                output_grad_golbal,
+                tmp_output_grad,
+                group=ctx.group,
+            )
+            # CP * [S, Depth // CP, HiddenSize // CP] -> [S, Depth // CP, HiddenSize]
+            tmp_output_grad = paddle.concat(output_grad_golbal, axis=-1)
+            output_grad_golbal = None
+            tmp_output_grad = paddle.split(tmp_output_grad, ctx.depth_per_rank, axis=1)
+
+            output_grad = [None] * len(embedding_weights)
+            for id, code_depth in enumerate(ctx.depth_list_cur_rank):
+                output_grad[code_depth] = tmp_output_grad[id]
+        else:
+            output_grad = paddle.split(output_grad, len(embedding_weights), axis=1)
+
+        weight_grad_list = [None] * len(embedding_weights)
+        for code_depth in ctx.depth_list_cur_rank:
+            weight_grad = _C_ops.embedding_grad(
+                input_ids[..., code_depth],
+                embedding_weights[code_depth],
+                output_grad[code_depth],
+                ctx.padding_idx,
+                False,  # sparse
+            )
+            weight_grad_list[code_depth] = weight_grad
+
+        for code_depth, weight_grad in enumerate(weight_grad_list):
+            src_rank = code_depth // ctx.depth_per_rank
+            if src_rank == ctx.group.rank:
+                weight_grad = weight_grad_list[code_depth]
+                assert weight_grad is not None, f"weight_grad is None, code_depth {code_depth}, src_rank {src_rank}"
+            else:
+                weight_grad = paddle.zeros_like(embedding_weights[code_depth])
+
+            paddle.distributed.broadcast(
+                weight_grad,
+                ctx.group.ranks[src_rank],
+                group=ctx.group,
+            )
+            weight_grad_list[code_depth] = weight_grad
+
+        return None, weight_grad_list
+
+
+def mark_context_parallel_parameter_disable_scale_grad(param_or_layer):
+    """
+    Mark parameters or layers to disable context parallel gradient scaling.
+
+    This function sets the attribute `context_parallel_disable_scale_grad` to `True` for the given parameter,
+    tensor, or layer. When set, this flag indicates that the specified parameter or layer should not have
+    its gradient scaled during context parallel training.
+
+    - If a `paddle.nn.Layer` is provided, both its `weight` and (if present) `bias` will be marked.
+    - If a `paddle.base.framework.Parameter` or `paddle.Tensor` is provided, it will be marked directly.
+    - Raises a `TypeError` if the input is not a supported type.
+
+    Args:
+        param_or_layer (paddle.nn.Layer or paddle.base.framework.Parameter or paddle.Tensor):
+            The parameter, tensor, or layer to mark as disabling context parallel gradient scaling.
+
+    Raises:
+        TypeError: If `param_or_layer` is not a `Parameter`, `Tensor`, or `Layer`.
+
+    Example:
+        >>> mark_context_parallel_parameter_disable_scale_grad(layer)
+        >>> mark_context_parallel_parameter_disable_scale_grad(param)
+    """
+
+    if isinstance(param_or_layer, paddle.nn.Layer):
+        setattr(param_or_layer.weight, "context_parallel_disable_scale_grad", True)
+        if hasattr(param_or_layer, "bias") and param_or_layer.bias is not None:
+            setattr(param_or_layer.bias, "context_parallel_disable_scale_grad", True)
+    elif isinstance(param_or_layer, (paddle.base.framework.Parameter, paddle.Tensor)):
+        setattr(param_or_layer, "context_parallel_disable_scale_grad", True)
+    else:
+        raise TypeError(f"param should be 'Parameter' or 'Tensor' or 'Layer', but received {type(param_or_layer)}")
+
+
+def context_parallel_parameter_disable_scale_grad(param):
+    """
+    Check whether context parallel gradient scaling is disabled for the parameter or tensor.
+
+    Returns the value of the `context_parallel_disable_scale_grad` attribute for the given parameter or tensor.
+    If the attribute is not set, returns `False` by default.
+
+    Args:
+        param (paddle.base.framework.Parameter or paddle.Tensor):
+            The parameter or tensor to check.
+
+    Returns:
+        bool: True if context parallel gradient scaling is disabled, False otherwise.
+
+    Example:
+        >>> if context_parallel_parameter_disable_scale_grad(param):
+        ...     # Handle parameter that should not have its gradient scaled
+        ...     pass
+    """
+    return getattr(param, "context_parallel_disable_scale_grad", False)
+
 
 def scatter_balance(input_tensor, group=None, axis=0):
     """
@@ -39,7 +230,7 @@ def scatter_balance(input_tensor, group=None, axis=0):
     """
     if group is None:
         hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = hcg.get_model_parallel_group()
 
     parallelism = group.nranks
     if parallelism == 1:
@@ -90,7 +281,7 @@ def all_gather_balance(input_tensor, group=None, axis=0):
     """
     if group is None:
         hcg = fleet.get_hybrid_communicate_group()
-        group = hcg.get_context_parallel_group()
+        group = hcg.get_model_parallel_group()
 
     parallelism = group.nranks
     if parallelism == 1:
@@ -165,7 +356,7 @@ def reduce_scatter_any_axis(input_tensor, axis, group=None):
         output_shape[0] = output_shape[0] // parallelism
 
         output = paddle.empty(shape=output_shape, dtype=input_tensor.dtype)
-        dist.stream.reduce_scatter(output, input_tensor, op=dist.ReduceOp.SUM, group=group, use_calc_stream=False)
+        dist.stream.reduce_scatter(output, input_tensor, op=dist.ReduceOp.SUM, group=group, use_calc_stream=True)
         return output
     else:
         # General case for other axes using alltoall
@@ -173,7 +364,7 @@ def reduce_scatter_any_axis(input_tensor, axis, group=None):
 
         output_buffers = [paddle.empty(input_chunks[0].shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
 
-        dist.stream.alltoall(output_buffers, input_chunks, group=group, use_calc_stream=False)
+        dist.stream.alltoall(output_buffers, input_chunks, group=group, use_calc_stream=True)
 
         # Sum the received chunks
         result = paddle.stack(output_buffers, axis=0).sum(axis=0)
@@ -225,7 +416,6 @@ def reduce_scatter_any_axis_balance(input_tensor, axis, group=None):
 
     # Perform alltoall communication
     output_buffers = [paddle.empty(combined_chunks[0].shape, dtype=input_tensor.dtype) for _ in range(parallelism)]
-    
 
     dist.stream.alltoall(output_buffers, combined_chunks, group=group, use_calc_stream=True)
 
@@ -488,16 +678,29 @@ def cp_flashmask_allgatherkv_balance_forward(query, key, value, startend_row_ind
         max_seqlen_q=seq_blocksize,
     )
 
-    # Perform flashmask attention with startend_row_indices
-    output, log_sum_exp = flashmask_attention(
-        query,
-        key_gathered,
-        value_gathered,
-        startend_row_indices=startend_row_indices,
-        causal=causal,
-        return_softmax_lse=True,
-        training=is_training,
-    )
+    fa_version = paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
+
+    if fa_version == 4:
+        output, log_sum_exp = _flash_attn_fwd(
+            query,
+            key_gathered,
+            value_gathered,
+            causal=causal,
+            return_lse=True,
+            startend_row_indices=startend_row_indices,
+            pack_gqa=False,
+        )
+    else:
+        # Perform flashmask attention with startend_row_indices
+        output, log_sum_exp = flashmask_attention(
+            query,
+            key_gathered,
+            value_gathered,
+            startend_row_indices=startend_row_indices,
+            causal=causal,
+            return_softmax_lse=True,
+            training=is_training,
+        )
 
     paddle.base.core.nvprof_nvtx_pop()
     return output, log_sum_exp, startend_row_indices
@@ -533,16 +736,17 @@ def cp_flashmask_allgatherkv_balance_backward(
     # All-gather key and value tensors (same as forward pass)
     key_gathered = all_gather_balance(key, axis=1, group=group)
     value_gathered = all_gather_balance(value, axis=1, group=group)
-    
-    x_np = startend_row_indices.numpy()
-    rank = dist.get_rank()
-    np.savetxt(f'tensor_{rank}.txt', x_np.reshape(-1, x_np.shape[-1]), fmt='%d')
-    print(f'rank:{rank} ,qshape:{query.shape}, kshape:{key.shape}, vshape:{value.shape}')
 
-    if paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"]:
+    fa_version = paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
+    if "block_mask" in inspect.signature(flashmask_attention).parameters:
+        if (
+            fa_version == 3
+            and paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"]
+            and query.shape[-1] > 128
+        ):
+            fa_version = 2
+    elif fa_version == 3 and paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"]:
         fa_version = 2
-    else:
-        fa_version = paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
     if fa_version == 2:
         # Create seed offset tensor (required for gradient computation)
         seed_offset = paddle.zeros(shape=[query.shape[1], query.shape[2]], dtype=paddle.int64)
@@ -561,34 +765,170 @@ def cp_flashmask_allgatherkv_balance_backward(
             causal,
         )
     elif fa_version == 3:
-        query_grad, key_grad_gathered, value_grad_gathered = paddle._C_ops.flashmask_attention_v2_grad(
+        if "block_mask" in inspect.signature(flashmask_attention).parameters:
+            query_grad, key_grad_gathered, value_grad_gathered = paddle._C_ops.flashmask_attention_v2_grad(
+                query,
+                key_gathered,
+                value_gathered,
+                output,
+                log_sum_exp,
+                startend_row_indices,
+                None,  # block_mask
+                output_grad,
+                query.shape[-1] ** (-0.5),
+                False,
+                0,      # rank
+                1       # nranks
+            )
+        else:
+            query_grad, key_grad_gathered, value_grad_gathered = paddle._C_ops.flashmask_attention_v2_grad(
+                query,
+                key_gathered,
+                value_gathered,
+                output,
+                log_sum_exp,
+                startend_row_indices,
+                output_grad,
+                query.shape[-1] ** (-0.5),
+                False,
+                0,      # rank
+                1       # nranks
+            )
+    elif fa_version == 4:
+        if startend_row_indices is not None:
+            flashmask_info = FlashMaskInfoPaddle(
+                startend_row_indices=startend_row_indices,
+                is_causal=causal,
+            )
+        else:
+            flashmask_info = None
+        query_grad, key_grad_gathered, value_grad_gathered = _flash_attn_bwd(
             query,
             key_gathered,
             value_gathered,
             output,
-            log_sum_exp,
-            startend_row_indices,
-            None,
             output_grad,
-            query.shape[-1] ** (-0.5),
-            False,
+            log_sum_exp,
+            flashmask_info,
+            causal=causal,
+            deterministic=paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"],
         )
     else:
         raise ValueError(f"FlashAttention version {fa_version} is not supported.")
-    
-    paddle.device.synchronize()
-    
-    rank = group.rank
-    print(f"rank:{rank} pass backward")
 
     # Reduce-scatter key and value gradients
     key_grad = reduce_scatter_any_axis_balance(key_grad_gathered, axis=1, group=group)
-    print(f"rank:{rank} pass key scatter")
     value_grad = reduce_scatter_any_axis_balance(value_grad_gathered, axis=1, group=group)
-    print(f"rank:{rank} pass value scatter")
 
     paddle.base.core.nvprof_nvtx_pop()
     return query_grad, key_grad, value_grad
+
+
+def scatter_with_padding(input_tensor, num_pad, axis, group):
+    """scatter_with_padding"""
+    cp_degree = group.nranks
+    cp_rank = group.rank
+
+    total_num = input_tensor.shape[axis]
+    avg_num = (total_num + num_pad) // cp_degree
+
+    split_sections = []
+    cnt = 0
+    rank_idx = 0
+    rank_pad = 0
+    for _ in range(0, cp_degree):
+        if cnt + avg_num < total_num:
+            split_sections.append(avg_num)
+        elif cnt < total_num:
+            split_sections.append(total_num - cnt)
+            rank_pad = avg_num - total_num + cnt
+        else:
+            break
+        cnt += avg_num
+        rank_idx += 1
+
+    if cp_rank < rank_idx:
+        list_of_res = paddle.split(input_tensor, num_or_sections=split_sections)
+        cur_res = list_of_res[cp_rank]
+        if rank_pad > 0 and cp_rank == rank_idx - 1:
+            pad_list = [0 for _ in range(0, input_tensor.ndim * 2)]
+            pad_list[axis * input_tensor.ndim * 2 + 1] = rank_pad
+            cur_res = paddle.nn.functional.pad(cur_res, pad_list, mode="constant", value=0)
+    else:
+        shape = input_tensor.shape
+        shape[axis] = avg_num
+        cur_res = paddle.zeros(shape, input_tensor.dtype)
+        cur_res.stop_gradient = False
+    return cur_res
+
+
+def all_gather_without_padding(input_tensor, num_pad, axis, group):
+    """all_gather_without_padding"""
+    output_shape = list(input_tensor.shape)
+    output_shape[axis] = output_shape[axis] * group.nranks
+    output_tensor = paddle.empty(shape=output_shape, dtype=input_tensor.dtype)
+    dist.stream.all_gather(output_tensor, input_tensor, group)
+    if num_pad > 0:
+        pad_start = output_tensor.shape[axis] - num_pad
+        output_tensor = paddle.slice(output_tensor, axes=[axis], starts=[0], ends=[pad_start])
+    return output_tensor
+
+
+class ContextParallelNormalScatter(PyLayer):
+    """ContextParallelNormalScatter"""
+
+    @staticmethod
+    def forward(ctx, input_tensor, num_pad, axis=0):
+        """forward"""
+        ctx.axis = axis
+        hcg = fleet.get_hybrid_communicate_group()
+        cp_degree = hcg.get_context_parallel_world_size()
+
+        if cp_degree == 1:
+            return input_tensor.clone()
+
+        group = hcg.get_context_parallel_group()
+        ctx.group = group
+        ctx.num_pad = num_pad
+        ctx.axis = axis
+
+        return scatter_with_padding(input_tensor, num_pad, axis, ctx.group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """backward"""
+        if ctx.group.nranks == 1:
+            return grad_output.clone()
+
+        return all_gather_without_padding(grad_output, ctx.num_pad, ctx.axis, ctx.group)
+
+
+class ContextParallelNormalGather(PyLayer):
+    """ContextParallelNormalGather"""
+
+    @staticmethod
+    def forward(ctx, input_tensor, num_pad, axis=0):
+        """forward"""
+        ctx.axis = axis
+        hcg = fleet.get_hybrid_communicate_group()
+        cp_degree = hcg.get_context_parallel_world_size()
+        group = hcg.get_context_parallel_group()
+        ctx.group = group
+        ctx.num_pad = num_pad
+
+        if cp_degree == 1:
+            return input_tensor.clone()
+
+        return all_gather_without_padding(input_tensor, num_pad, axis, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """backward"""
+        if ctx.group.nranks == 1:
+            return grad_output.clone()
+
+        return scatter_with_padding(grad_output, ctx.num_pad, ctx.axis, ctx.group)
+
 
 class FlashMaskContextParallel(PyLayer):
     """
@@ -756,3 +1096,4 @@ def flashmask_attention_cp(
         mode,
     )
     return output
+
